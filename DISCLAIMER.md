@@ -1,51 +1,21 @@
-# Disclaimer & Legal Notice
+# Disclaimer
 
-## Purpose
-
-This repository is maintained for **educational, defensive security research, and software supply-chain analysis** purposes only.
-
-## Source of Material
-
-The analysis is based on source code that was **publicly accessible** through a source map file (`cli.js.map`) included in the npm package `@anthropic-ai/claude-code@2.1.88`. Source maps are standard debugging artifacts (Source Map v3 format), and their `sourcesContent` field contained the original TypeScript source.
-
-- The source map was publicly available via npm, a public package registry
-- No systems were breached, hacked, or exploited to obtain this material
-- The exposure was identified by security researcher [Chaofan Shou (@shoucccc)](https://x.com/Fried_rice/status/2038894956459290963) on March 31, 2026
+This repository is an **educational guide** for building AI agents from scratch.
 
 ## What This Repository Contains
-
-- **Analysis documents** — original commentary, architecture diagrams, and security findings written by the authors of this repository
-- **Code snippets** — brief excerpts from the source code, quoted for purposes of commentary, criticism, and research (fair use)
+- Step-by-step tutorials for building AI agents
+- Working Python code examples for educational purposes
+- Architecture diagrams and explanations
 
 ## What This Repository Does NOT Contain
+- Complete source code of any commercial AI product
+- Any proprietary or confidential information
+- Any tools for exploiting vulnerabilities
 
-- The complete source code of Claude Code
-- Any user data, API keys (beyond those already hardcoded in the public npm package), or model weights
-- Any tools or instructions for exploiting vulnerabilities
+## Attribution
+- The original repository structure is forked from [openedclaude/claude-reviews-claude](https://github.com/openedclaude/claude-reviews-claude)
+- All content has been completely rewritten for the Agent Development Guide purpose
+- Code examples are original and written for educational purposes
 
-## Intellectual Property
-
-- The original Claude Code source code is the property of **Anthropic, PBC**
-- This repository is **not affiliated with, endorsed by, or maintained by Anthropic**
-- All original analysis, diagrams, and commentary in this repository are the work of the repository authors
-
-## Fair Use
-
-The use of brief code excerpts in this repository is believed to constitute **fair use** under applicable copyright law, as it is:
-
-1. **Transformative** — The excerpts are used for commentary, criticism, and educational analysis, not as a substitute for the original work
-2. **Limited** — Only small, relevant portions are quoted
-3. **Non-commercial** — This repository is freely available and serves no commercial purpose
-4. **No market harm** — This analysis does not compete with or substitute for Claude Code itself
-
-## Responsible Disclosure
-
-If any content in this repository is believed to pose a genuine security risk, please [open an issue](../../issues) or contact the maintainers. We are committed to responsible disclosure and will promptly address legitimate concerns.
-
-## DMCA / Takedown
-
-If Anthropic or any rights holder believes specific content in this repository infringes their intellectual property, please contact the maintainers, and we will promptly review and address the request.
-
----
-
-*This disclaimer was last updated on March 31, 2026.*
+## License
+This project is licensed under the MIT License - see the LICENSE file for details.

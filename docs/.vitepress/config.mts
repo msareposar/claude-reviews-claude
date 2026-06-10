@@ -1,159 +1,170 @@
 import { defineConfig } from 'vitepress'
 
 export default defineConfig({
-  title: 'Claude Reviews Claude',
-  description: 'Claude Reviews Claude Code — 当 AI 阅读自己的源代码',
+  title: 'Agent Development Guide',
+  description: '零基础搭建你的第一个 AI 智能体 | Build Your First AI Agent from Scratch',
   base: '/claude-reviews-claude/',
-  cleanUrls: true,
   lastUpdated: true,
-  ignoreDeadLinks: true,
+  cleanUrls: true,
 
   head: [
-    ['meta', { name: 'theme-color', content: '#D97757' }],
-    ['meta', { name: 'og:type', content: 'website' }],
-    ['meta', { name: 'og:title', content: 'Claude Code Deep Dive' }],
-    ['meta', { name: 'og:description', content: '17 篇架构深度分析 — 由 Claude 亲笔解构 Claude Code' }],
-    ['link', { rel: 'preconnect', href: 'https://fonts.googleapis.com' }],
-    ['link', { rel: 'preconnect', href: 'https://fonts.gstatic.com', crossorigin: '' }],
-    ['link', { href: 'https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap', rel: 'stylesheet' }],
+    ['link', { rel: 'icon', href: '/claude-reviews-claude/favicon.svg' }],
+    ['meta', { name: 'theme-color', content: '#7c3aed' }],
   ],
 
   themeConfig: {
-    logo: '/logo.svg',
-    search: { provider: 'local' },
+    logo: { src: '/claude-reviews-claude/logo.svg', width: 32, height: 32 },
+
     socialLinks: [
-      { icon: 'github', link: 'https://github.com/openedclaude/claude-reviews-claude' },
+      { icon: 'github', link: 'https://github.com/msareposar/claude-reviews-claude' },
     ],
+
+    search: {
+      provider: 'local',
+    },
+
+    // English nav
+    nav: [
+      { text: 'Guide', link: '/overview', activeMatch: '^/(overview|chapters/)' },
+      { text: '中文', link: '/zh-CN/overview' },
+      { text: 'GitHub', link: 'https://github.com/msareposar/claude-reviews-claude' },
+    ],
+
+    // English sidebar
+    sidebar: {
+      '/chapters/': [
+        {
+          text: 'Part 1: Foundation',
+          collapsed: false,
+          items: [
+            { text: '00. Welcome to the Agent World', link: '/overview' },
+            { text: '01. The Brain: Understanding LLMs', link: '/chapters/01-foundation-llm' },
+            { text: '02. Build Your First Agent', link: '/chapters/02-first-agent' },
+          ],
+        },
+        {
+          text: 'Part 2: Core Loop',
+          collapsed: false,
+          items: [
+            { text: '03. Think → Act → Observe Loop', link: '/chapters/03-core-loop' },
+            { text: '04. Tool System: Hands & Feet', link: '/chapters/04-tool-system' },
+            { text: '05. Prompt Engineering for Agents', link: '/chapters/05-prompt-engineering' },
+          ],
+        },
+        {
+          text: 'Part 3: Make It Smart',
+          collapsed: false,
+          items: [
+            { text: '06. Context & Working Memory', link: '/chapters/06-context-memory' },
+            { text: '07. Long-Term Memory', link: '/chapters/07-long-term-memory' },
+            { text: '08. Error Handling & Resilience', link: '/chapters/08-error-handling' },
+            { text: '09. Planning & Reasoning', link: '/chapters/09-planning-reasoning' },
+          ],
+        },
+        {
+          text: 'Part 4: Advanced',
+          collapsed: false,
+          items: [
+            { text: '10. Multi-Agent Collaboration', link: '/chapters/10-multi-agent' },
+            { text: '11. Plugin System', link: '/chapters/11-plugin-system' },
+            { text: '12. Security & Permissions', link: '/chapters/12-security' },
+          ],
+        },
+        {
+          text: 'Part 5: Engineering',
+          collapsed: false,
+          items: [
+            { text: '13. Testing Your Agent', link: '/chapters/13-testing' },
+            { text: '14. Configuration & Environment', link: '/chapters/14-configuration' },
+            { text: '15. Persistence & Storage', link: '/chapters/15-persistence' },
+            { text: '16. Deployment', link: '/chapters/16-deployment' },
+          ],
+        },
+        {
+          text: 'Part 6: Operations',
+          collapsed: false,
+          items: [
+            { text: '17. Monitoring & Improvement', link: '/chapters/17-monitoring' },
+          ],
+        },
+      ],
+    },
   },
 
   locales: {
     root: {
       label: 'English',
       lang: 'en',
-      themeConfig: {
-        nav: [
-          { text: 'Overview', link: '/overview' },
-          { text: 'Chapters', link: '/chapters/01-query-engine' },
-          { text: 'GitHub', link: 'https://github.com/openedclaude/claude-reviews-claude' },
-        ],
-        sidebar: {
-          '/': [
-            {
-              text: 'Getting Started',
-              items: [
-                { text: 'Overview', link: '/overview' },
-              ],
-            },
-            {
-              text: 'Architecture Deep Dive',
-              items: [
-                { text: '01 — Query Engine', link: '/chapters/01-query-engine' },
-                { text: '02 — Tool System', link: '/chapters/02-tool-system' },
-                { text: '03 — Coordinator', link: '/chapters/03-coordinator' },
-                { text: '04 — Plugin System', link: '/chapters/04-plugin-system' },
-                { text: '05 — Hook System', link: '/chapters/05-hook-system' },
-                { text: '06 — Bash Engine', link: '/chapters/06-bash-engine' },
-                { text: '07 — Permission Pipeline', link: '/chapters/07-permission-pipeline' },
-                { text: '08 — Agent Swarms', link: '/chapters/08-agent-swarms' },
-                { text: '09 — Session Persistence', link: '/chapters/09-session-persistence' },
-                { text: '10 — Context Assembly', link: '/chapters/10-context-assembly' },
-                { text: '11 — Compact System', link: '/chapters/11-compact-system' },
-                { text: '12 — Startup Bootstrap', link: '/chapters/12-startup-bootstrap' },
-                { text: '13 — Bridge System', link: '/chapters/13-bridge-system' },
-                { text: '14 — UI State Management', link: '/chapters/14-ui-state-management' },
-                { text: '15 — Services & API Layer', link: '/chapters/15-services-api-layer' },
-                { text: '16 — Infrastructure & Config', link: '/chapters/16-infrastructure-config' },
-                { text: '17 — Telemetry & Privacy', link: '/chapters/17-telemetry-privacy-operations' },
-              ],
-            },
-          ],
-        },
-        editLink: {
-          pattern: 'https://github.com/openedclaude/claude-reviews-claude/edit/main/docs/:path',
-          text: 'Edit this page on GitHub',
-        },
-        footer: {
-          message: 'Released under the MIT License.',
-          copyright: 'Analysis by Claude · Code by Anthropic, PBC',
-        },
-        docFooter: {
-          prev: '← Previous Chapter',
-          next: 'Next Chapter →',
-        },
-      },
     },
-
     'zh-CN': {
       label: '简体中文',
       lang: 'zh-CN',
       link: '/zh-CN/',
       themeConfig: {
         nav: [
-          { text: '架构总纲', link: '/zh-CN/overview' },
-          { text: '章节导读', link: '/zh-CN/chapters/01-query-engine' },
-          { text: 'GitHub', link: 'https://github.com/openedclaude/claude-reviews-claude' },
+          { text: '指南', link: '/zh-CN/overview', activeMatch: '^/zh-CN/(overview|chapters/)' },
+          { text: 'English', link: '/overview' },
+          { text: 'GitHub', link: 'https://github.com/msareposar/claude-reviews-claude' },
         ],
         sidebar: {
-          '/zh-CN/': [
+          '/zh-CN/chapters/': [
             {
-              text: '开始阅读',
+              text: '第一部分：基础篇',
+              collapsed: false,
               items: [
-                { text: '架构总纲', link: '/zh-CN/overview' },
+                { text: '00. 欢迎来到智能体世界', link: '/zh-CN/overview' },
+                { text: '01. 智能体的大脑：认识 LLM', link: '/zh-CN/chapters/01-foundation-llm' },
+                { text: '02. 动手搭建第一个智能体', link: '/zh-CN/chapters/02-first-agent' },
               ],
             },
             {
-              text: '架构深度分析',
+              text: '第二部分：核心循环',
+              collapsed: false,
               items: [
-                { text: '01 — 查询引擎', link: '/zh-CN/chapters/01-query-engine' },
-                { text: '02 — 工具系统', link: '/zh-CN/chapters/02-tool-system' },
-                { text: '03 — 多智能体协调器', link: '/zh-CN/chapters/03-coordinator' },
-                { text: '04 — 插件系统', link: '/zh-CN/chapters/04-plugin-system' },
-                { text: '05 — 钩子系统', link: '/zh-CN/chapters/05-hook-system' },
-                { text: '06 — Bash 执行引擎', link: '/zh-CN/chapters/06-bash-engine' },
-                { text: '07 — 权限流水线', link: '/zh-CN/chapters/07-permission-pipeline' },
-                { text: '08 — Swarm 智能体', link: '/zh-CN/chapters/08-agent-swarms' },
-                { text: '09 — 会话持久化', link: '/zh-CN/chapters/09-session-persistence' },
-                { text: '10 — 上下文装配', link: '/zh-CN/chapters/10-context-assembly' },
-                { text: '11 — 压缩系统', link: '/zh-CN/chapters/11-compact-system' },
-                { text: '12 — 启动与引导', link: '/zh-CN/chapters/12-startup-bootstrap' },
-                { text: '13 — 桥接系统', link: '/zh-CN/chapters/13-bridge-system' },
-                { text: '14 — UI 与状态管理', link: '/zh-CN/chapters/14-ui-state-management' },
-                { text: '15 — 服务与 API 层', link: '/zh-CN/chapters/15-services-api-layer' },
-                { text: '16 — 基础设施与配置', link: '/zh-CN/chapters/16-infrastructure-config' },
-                { text: '17 — 遥测、隐私与运营', link: '/zh-CN/chapters/17-telemetry-privacy-operations' },
+                { text: '03. 思考→行动→观察循环', link: '/zh-CN/chapters/03-core-loop' },
+                { text: '04. 工具系统：手脚并用的智能体', link: '/zh-CN/chapters/04-tool-system' },
+                { text: '05. 智能体提示词工程', link: '/zh-CN/chapters/05-prompt-engineering' },
+              ],
+            },
+            {
+              text: '第三部分：让它变聪明',
+              collapsed: false,
+              items: [
+                { text: '06. 上下文与工作记忆', link: '/zh-CN/chapters/06-context-memory' },
+                { text: '07. 长期记忆系统', link: '/zh-CN/chapters/07-long-term-memory' },
+                { text: '08. 错误处理与韧性', link: '/zh-CN/chapters/08-error-handling' },
+                { text: '09. 任务规划与推理', link: '/zh-CN/chapters/09-planning-reasoning' },
+              ],
+            },
+            {
+              text: '第四部分：进阶能力',
+              collapsed: false,
+              items: [
+                { text: '10. 多智能体协作', link: '/zh-CN/chapters/10-multi-agent' },
+                { text: '11. 插件系统', link: '/zh-CN/chapters/11-plugin-system' },
+                { text: '12. 安全与权限管理', link: '/zh-CN/chapters/12-security' },
+              ],
+            },
+            {
+              text: '第五部分：工程实践',
+              collapsed: false,
+              items: [
+                { text: '13. 测试你的智能体', link: '/zh-CN/chapters/13-testing' },
+                { text: '14. 配置与环境管理', link: '/zh-CN/chapters/14-configuration' },
+                { text: '15. 持久化存储', link: '/zh-CN/chapters/15-persistence' },
+                { text: '16. 部署上线', link: '/zh-CN/chapters/16-deployment' },
+              ],
+            },
+            {
+              text: '第六部分：运营运维',
+              collapsed: false,
+              items: [
+                { text: '17. 监控与持续改进', link: '/zh-CN/chapters/17-monitoring' },
               ],
             },
           ],
         },
-        editLink: {
-          pattern: 'https://github.com/openedclaude/claude-reviews-claude/edit/main/docs/:path',
-          text: '在 GitHub 上编辑此页',
-        },
-        footer: {
-          message: '基于 MIT 许可证发布',
-          copyright: '分析：Claude · 代码：Anthropic, PBC',
-        },
-        docFooter: {
-          prev: '← 上一章',
-          next: '下一章 →',
-        },
-        lastUpdated: {
-          text: '最后更新于',
-        },
-        outline: {
-          label: '本页目录',
-        },
-        returnToTopLabel: '返回顶部',
-        sidebarMenuLabel: '菜单',
-        darkModeSwitchLabel: '主题',
       },
-    },
-  },
-
-  markdown: {
-    lineNumbers: true,
-    image: {
-      lazyLoading: true,
     },
   },
 })

@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" width="120" height="120">
+  <rect width="120" height="120" rx="20" fill="#7c3aed"/>
+  <circle cx="40" cy="52" r="18" fill="#fff" opacity="0.9"/>
+  <circle cx="80" cy="52" r="18" fill="#fff" opacity="0.9"/>
+  <circle cx="40" cy="52" r="7" fill="#7c3aed"/>
+  <circle cx="80" cy="52" r="7" fill="#7c3aed"/>
+  <path d="M60 68 L48 92 L72 92 Z" fill="#fff" opacity="0.9"/>
+  <rect x="52" y="82" width="16" height="5" rx="2" fill="#7c3aed"/>
+  <path d="M20 98 L60 108 L100 98" stroke="#fff" stroke-width="3" fill="none" opacity="0.4"/>
+  <text x="60" y="30" text-anchor="middle" fill="#fff" font-family="sans-serif" font-weight="bold" font-size="11">AGENT</text>
+</svg>

@@ -1,64 +1,33 @@
 ---
+# https://vitepress.dev/reference/default-theme-home-page
 layout: home
+
 hero:
-  name: "Claude Reviews Claude"
-  text: "When AI Reads Its Own Source Code"
-  tagline: "17 architecture deep dives written by Claude, dissecting Claude Code v2.1.88 — 1,902 files, 477K lines of TypeScript."
+  name: "🤖 Agent Development Guide"
+  text: "Build Your First AI Agent from Zero"
+  tagline: A step-by-step guide for everyone — students, developers, and curious minds. No prior AI experience needed.
+  image:
+    src: /claude-reviews-claude/logo.svg
+    alt: Agent Development Guide
   actions:
     - theme: brand
-      text: Start Reading →
+      text: Start Learning
       link: /overview
     - theme: alt
-      text: 简体中文
-      link: /zh-CN/
-    - theme: alt
-      text: GitHub ⭐
-      link: https://github.com/openedclaude/claude-reviews-claude
+      text: GitHub
+      link: https://github.com/msareposar/claude-reviews-claude
 
 features:
-  - icon: ⚙️
-    title: Query Engine
-    details: The 12-step state machine that powers the core while(true) tool loop — the "brain" of Claude Code.
-    link: /chapters/01-query-engine
-  - icon: 🔧
-    title: Tool System
-    details: 42+ tools as self-contained modules — Schema-driven registration, validation, and execution.
-    link: /chapters/02-tool-system
-  - icon: 🔐
-    title: Permission Pipeline
-    details: 7-layer defense-in-depth — from config rules to AST analysis to OS sandboxing.
-    link: /chapters/07-permission-pipeline
-  - icon: 🤖
-    title: Agent Swarms
-    details: Multi-agent coordination — mailbox IPC, backend detection, and permission delegation.
-    link: /chapters/08-agent-swarms
-  - icon: 📦
-    title: Context Assembly
-    details: 3-layer context assembly — system prompts, CLAUDE.md memory, per-turn attachments.
-    link: /chapters/10-context-assembly
-  - icon: 🖥️
-    title: Terminal UI
-    details: Forked Ink + React 19, Vim mode, IDE bridge — 140+ components powering the CLI experience.
-    link: /chapters/14-ui-state-management
+  - title: "🎯 From Zero to Agent"
+    details: Start with "what's an LLM?" and end with a production-ready agent. Every chapter builds on the last.
+  - title: "💻 Real Code, Every Chapter"
+    details: No hand-waving. Each chapter has complete, runnable Python code you can type and run yourself.
+  - title: "🧩 Build from Scratch"
+    details: No framework magic. You'll build everything yourself and truly understand how agents work.
+  - title: "🌍 Bilingual"
+    details: Full English and Chinese versions available. Switch with one click.
+  - title: "🔧 Production Ready"
+    details: Cover testing, deployment, monitoring — the skills you need to ship real agent applications.
+  - title: "🎮 Fun & Interactive"
+    details: Exercises, challenges, and mini-projects at the end of each chapter to reinforce learning.
 ---
-
-<style>
-:root {
-  --vp-home-hero-name-color: transparent;
-  --vp-home-hero-name-background: linear-gradient(135deg, #D97757, #E8A87C, #F0C4A8);
-}
-
-.VPHero .name {
-  font-size: 56px !important;
-  line-height: 1.1 !important;
-}
-
-.VPHero .text {
-  font-size: 32px !important;
-  line-height: 1.3 !important;
-}
-
-.VPHero .main {
-  max-width: 700px;
-}
-</style>
