@@ -345,4 +345,53 @@ print(result)
 - 工具描述写得好，LLM 用得对
 - 多步循环让智能体能完成复杂的任务
 
+### 真实的 claude-code 如何命名工具
+
+在真实的 **claude-code**（[源码](https://github.com/ChinaSiro/claude-code-sourcemap)）中，工具名称遵循精确的命名约定：
+
+**源码：[`restored-src/src/Tool.ts`](https://github.com/ChinaSiro/claude-code-sourcemap/blob/main/restored-src/src/Tool.ts)**
+
+每个工具有：
+- **`name`**：规范名称（如 `Bash`、`FileRead`、`Edit`）
+- **`aliases`**：别名（如 `Bash` 也响应 `shell`、`command`）
+- **`searchHint`**：用于工具搜索的简短描述
+
+```python
+# 概念模型：claude-code 如何定义工具名称
+# 源码：restored-src/src/Tool.ts
+
+class ToolDef:
+    def __init__(self, name: str, description: str, 
+                 aliases: list[str] = None,
+                 search_hint: str = ""):
+        self.name = name
+        self.description = description
+        self.aliases = aliases or []
+        self.search_hint = search_hint
+
+# 示例：真实的 claude-code 工具命名模式
+tools = [
+    ToolDef(
+        name="Bash",
+        description="运行 shell 命令并获取输出",
+        aliases=["shell", "terminal", "command"],
+        search_hint="执行 CLI 命令、脚本、程序",
+    ),
+    ToolDef(
+        name="FileRead",
+        description="从文件系统读取文件",
+        aliases=["read", "cat", "view"],
+        search_hint="查看文件内容、阅读代码",
+    ),
+    ToolDef(
+        name="FileWrite",
+        description="创建和覆盖文件",
+        aliases=["write", "create"],
+        search_hint="保存输出、写入文件",
+    ),
+]
+```
+
+`aliases` 别名系统很重要，因为不同的 LLM 可能尝试为同一个概念工具使用不同的名称。如果一个 LLM 说"我用 `shell`"，但工具名为 `Bash`，别名确保仍然能找到正确的工具。这对应了真实代码中 `findToolByName()` 的工作方式——它同时检查名称和别名，如果都不匹配则回退到搜索。
+
 > **下一章：思考→行动→观察循环——深入理解智能体的核心运行机制！**

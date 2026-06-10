@@ -798,6 +798,215 @@ class ToolRegistry:
 
 > **A good tool system is invisible. The LLM doesn't know or care how tools are implemented. It just sees clean names, clear descriptions, and gets reliable results. Your job is to make the tools reliable, well-described, and error-resistant.**
 
+### Behind the Code: How claude-code Defines Tools
+
+The class-based pattern above is great for learning. But for reference, here's how the **real claude-code** ([sourcemap](https://github.com/ChinaSiro/claude-code-sourcemap)) defines its tools — it uses a functional composition pattern with type safety:
+
+**Source: [`restored-src/src/Tool.ts`](https://github.com/ChinaSiro/claude-code-sourcemap/blob/main/restored-src/src/Tool.ts)**
+
+In claude-code, a tool is a plain object created by `buildTool(ToolDef)`:
+
+```python
+# Python translation of claude-code's tool pattern
+# Original: restored-src/src/Tool.ts
+
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional, Protocol
+
+# ─── Schema Validation (like Zod in the real code) ───
+
+class Schema:
+    """Simplified schema validator, inspired by Zod schemas used in claude-code."""
+    def __init__(self, schema_dict: dict):
+        self.schema = schema_dict
+        self._validators = []
+
+    def validate(self, data: dict) -> tuple[bool, Optional[str]]:
+        """Validate input data against the schema.
+        Returns (is_valid, error_message)."""
+        for key, props in self.schema.get("properties", {}).items():
+            if key in props.get("required", []) and key not in data:
+                return False, f"Missing required field: {key}"
+            if key in data and props.get("type") == "string" \
+               and not isinstance(data[key], str):
+                return False, f"{key} must be a string"
+        return True, None
+
+    def to_json_schema(self) -> Dict[str, Any]:
+        return self.schema
+
+
+# ─── Tool Definition (buildTool pattern) ───
+
+class Tool:
+    """
+    A tool object, built from a ToolDef.
+    Mirrors claude-code's Tool<Input, Output, P> type.
+    """
+    def __init__(
+        self,
+        name: str,
+        description: str,
+        input_schema: Schema,
+        call_fn: Callable[..., str],
+        is_concurrency_safe: bool = True,
+        aliases: Optional[List[str]] = None,
+        search_hint: str = "",
+    ):
+        self.name = name
+        self.description = description
+        self.input_schema = input_schema
+        self._call = call_fn
+        self.is_concurrency_safe = is_concurrency_safe
+        self.aliases = aliases or []
+        self.search_hint = search_hint
+
+    def call(self, **kwargs) -> str:
+        """Execute the tool. Claude-code calls runTools() which invokes this."""
+        is_valid, error = self.input_schema.validate(kwargs)
+        if not is_valid:
+            return f"ValidationError: {error}"
+        return self._call(**kwargs)
+
+    def to_openai_schema(self) -> Dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.input_schema.to_json_schema(),
+            },
+        }
+
+
+# ─── buildTool: creates a Tool from a definition ───
+
+class ToolDef:
+    """The definition used to build a tool (like ToolDef in claude-code's Tool.ts)."""
+    def __init__(
+        self,
+        name: str,
+        description: str,
+        input_schema: Schema,
+        call: Callable[..., str],
+        is_concurrency_safe: bool = True,
+    ):
+        self.name = name
+        self.description = description
+        self.input_schema = input_schema
+        self.call = call
+        self.is_concurrency_safe = is_concurrency_safe
+
+
+def build_tool(tool_def: ToolDef) -> Tool:
+    """
+    Build a Tool from a ToolDef.
+    In claude-code this fills in defaults and wraps call() with error handling.
+    Source: restored-src/src/Tool.ts — function buildTool(ToolDef)
+    """
+    return Tool(
+        name=tool_def.name,
+        description=tool_def.description,
+        input_schema=tool_def.input_schema,
+        call_fn=tool_def.call,
+        is_concurrency_safe=tool_def.is_concurrency_safe,
+    )
+
+
+# ─── Tool Registry (findToolByName pattern) ───
+
+class ToolRegistry:
+    """
+    Registry that holds all tools.
+    Mirrors how claude-code collects tools into a list and uses findToolByName().
+    """
+    def __init__(self):
+        self._tools: Dict[str, Tool] = {}
+
+    def register(self, tool: Tool) -> None:
+        self._tools[tool.name] = tool
+
+    def register_many(self, tools: List[Tool]) -> None:
+        for t in tools:
+            self.register(t)
+
+    def find_tool(self, name: str) -> Optional[Tool]:
+        """
+        Find a tool by name or alias.
+        Mirrors findToolByName() in claude-code's Tool.ts.
+        """
+        tool = self._tools.get(name)
+        if tool:
+            return tool
+        # Check aliases
+        for t in self._tools.values():
+            if name in t.aliases:
+                return t
+        return None
+
+    def run_tool(self, name: str, args: Dict[str, Any]) -> str:
+        tool = self.find_tool(name)
+        if not tool:
+            return f"Error: Unknown tool '{name}'"
+        return tool.call(**args)
+
+    def get_openai_schemas(self) -> List[Dict[str, Any]]:
+        return [t.to_openai_schema() for t in self._tools.values()]
+
+    def concurrency_safe_tools(self) -> List[Tool]:
+        """
+        Get tools that can run in parallel.
+        Claude-code partitions tools into concurrent-safe and unsafe batches.
+        See: restored-src/src/services/tools/StreamingToolExecutor.ts
+        """
+        return [t for t in self._tools.values() if t.is_concurrency_safe]
+
+
+# ─── Example: Build a Calculator Tool ───
+
+calc_schema = Schema({
+    "type": "object",
+    "properties": {
+        "expression": {
+            "type": "string",
+            "description": "Math expression like '2 + 2'",
+        },
+    },
+    "required": ["expression"],
+})
+
+def calc_impl(expression: str) -> str:
+    import math
+    allowed = {"abs": abs, "sqrt": math.sqrt, "pi": math.pi, "e": math.e}
+    try:
+        return str(eval(expression, {"__builtins__": {}}, allowed))
+    except Exception as e:
+        return f"Error: {e}"
+
+calculator = build_tool(ToolDef(
+    name="calculate",
+    description="Evaluate a mathematical expression",
+    input_schema=calc_schema,
+    call=calc_impl,
+    is_concurrency_safe=True,
+))
+
+registry = ToolRegistry()
+registry.register(calculator)
+```
+
+**Key differences from the class-based approach:**
+
+| Class-based (this chapter) | Claude-code style (functional) |
+|---|---|
+| Each tool is a class instance | Each tool is built from a `ToolDef` via `buildTool()` |
+| Schema defined via `@property` | Schema defined as a `Schema` object (Zod in TypeScript) |
+| Error handling is inline | Validation happens before `call()` via `input_schema.validate()` |
+| Manual dispatch | `findToolByName()` with alias support |
+| No concurrency model | `isConcurrencySafe()` controls parallel execution |
+
+In claude-code, tools also declare `isReadOnly`, `isDestructive`, `interruptBehavior`, and `canUseTool` for fine-grained permission control. The `StreamingToolExecutor` ([source](https://github.com/ChinaSiro/claude-code-sourcemap/blob/main/restored-src/src/services/tools/StreamingToolExecutor.ts)) partitions tools into concurrent-safe and unsafe batches, executing the safe ones in parallel and the unsafe ones sequentially.
+
 ### What's Next?
 
 In **[Chapter 05: Prompt Engineering for Agents](./05-prompt-engineering.md)**, you'll learn how to craft system prompts that make your agent smarter. You'll see how the same tools can behave completely differently with different prompts, and how to dynamically inject context like time, user info, and available tools into your prompts.

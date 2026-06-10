@@ -568,6 +568,55 @@ def run_agent(user_input):
         return msg.content
 ```
 
+### Behind the Code: How claude-code Names Its Tools
+
+In the **real claude-code** ([sourcemap](https://github.com/ChinaSiro/claude-code-sourcemap)), tool names follow a precise convention. Looking at the source:
+
+**Source: [`restored-src/src/Tool.ts`](https://github.com/ChinaSiro/claude-code-sourcemap/blob/main/restored-src/src/Tool.ts)**
+
+Each tool has:
+- **`name`**: The canonical name (e.g., `Bash`, `FileRead`, `Edit`)
+- **`aliases`**: Alternative names (e.g., `Bash` also responds to `shell`, `command`)
+- **`searchHint`**: A short description for tool search
+
+```python
+# Conceptual model: how claude-code defines tool names
+# Source: restored-src/src/Tool.ts
+
+class ToolDef:
+    def __init__(self, name: str, description: str, 
+                 aliases: list[str] = None,
+                 search_hint: str = ""):
+        self.name = name
+        self.description = description
+        self.aliases = aliases or []
+        self.search_hint = search_hint
+
+# Example: real claude-code tool name patterns
+tools = [
+    ToolDef(
+        name="Bash",
+        description="Run shell commands and get output",
+        aliases=["shell", "terminal", "command"],
+        search_hint="Execute CLI commands, scripts, programs",
+    ),
+    ToolDef(
+        name="FileRead",
+        description="Read files from the filesystem",
+        aliases=["read", "cat", "view"],
+        search_hint="View file contents, read code",
+    ),
+    ToolDef(
+        name="FileWrite",
+        description="Create and overwrite files",
+        aliases=["write", "create"],
+        search_hint="Save output, write to files",
+    ),
+]
+```
+
+The `aliases` system is important because different LLMs may try different names for the same conceptual tool. If an LLM says "I'll use `shell`" but the tool is named `Bash`, aliases ensure the right tool is still found. This mirrors how `findToolByName()` works in the real code — it checks both name and aliases before falling back to search.
+
 ### The Key Insight
 
 > **An LLM cannot do precise math, but it knows when math is needed. Your job is to give it the tools and trust it to decide when to use them.**

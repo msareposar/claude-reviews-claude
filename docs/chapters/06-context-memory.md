@@ -347,4 +347,122 @@ class HybridContext:
 - **Summary compression** condenses old messages to save space
 - A good memory system is essential for useful agents
 
+### Behind the Code: How claude-code Manages Context and Memory
+
+The real **claude-code** ([sourcemap](https://github.com/ChinaSiro/claude-code-sourcemap)) handles context management very differently from the educational examples above. Here's what actually happens:
+
+**Source: [`restored-src/src/services/compact/compact.ts`](https://github.com/ChinaSiro/claude-code-sourcemap/blob/main/restored-src/src/services/compact/compact.ts)**
+
+#### Auto-Compaction
+
+Instead of a sliding window, claude-code uses **auto-compaction** — it automatically compresses context when it's about to overflow:
+
+```python
+# Conceptual model of claude-code's auto-compaction
+# Source: restored-src/src/services/compact/compact.ts
+
+class ContextCompactor:
+    """
+    Automatically compacts context when nearing the token limit.
+    
+    In the real claude-code, this produces a "compact transcript" that
+    replaces old messages with summarized versions, preserving key
+    decisions and results while dropping verbatim tool outputs.
+    """
+    def __init__(self, max_tokens: int = 128000):
+        self.max_tokens = max_tokens
+        self.compaction_threshold = int(max_tokens * 0.75)  # 75% triggers compaction
+        
+    def needs_compaction(self, current_tokens: int) -> bool:
+        """Check if context needs compaction (triggered at ~75% capacity)."""
+        return current_tokens > self.compaction_threshold
+    
+    def compact(self, messages: list) -> list:
+        """
+        Compact the message list by summarizing older exchanges.
+        
+        Key behaviors:
+        - Keeps system prompt intact
+        - Preserves the most recent user-tool interactions verbatim
+        - Summarizes older tool results into concise descriptions
+        - Retains all tool call structure (names, arguments), only compressing outputs
+        """
+        # Keep system prompt + last N exchanges verbatim
+        system_msgs = [m for m in messages if m["role"] == "system"]
+        recent = messages[-6:] if len(messages) > 6 else messages  # Keep last 3 turns
+        old = messages[len(system_msgs):-6] if len(messages) > 6 else []
+        
+        if not old:
+            return messages
+        
+        # Summarize old messages (simplified)
+        summary = f"[Compact: {len(old)} older messages summarized]"
+        compacted = system_msgs + [
+            {"role": "system", "content": f"Previous context: {summary}"}
+        ] + recent
+        
+        return compacted
+```
+
+#### Memdir: File-Based Memory
+
+Claude-code doesn't store memory in the conversation itself — it uses a **memdir** (`~/.claude/memory/`) with individual markdown files:
+
+**Source: [`restored-src/src/commands/memory/memory.tsx`](https://github.com/ChinaSiro/claude-code-sourcemap/blob/main/restored-src/src/commands/memory/memory.tsx)**
+
+```python
+# Conceptual model of claude-code's memory system
+# Source: restored-src/src/memory.ts
+
+import os
+from pathlib import Path
+from datetime import datetime
+
+class Memdir:
+    """
+    File-based memory storage.
+    
+    Claude-code stores each memory as a markdown file in ~/.claude/memory/.
+    Each file is a separate "note" the agent can write and read.
+    """
+    def __init__(self, memdir_path: str = "~/.claude/memory"):
+        self.path = Path(memdir_path).expanduser()
+        self.path.mkdir(parents=True, exist_ok=True)
+    
+    def write(self, title: str, content: str) -> str:
+        """Write a memory file. Source: memory.tsx — writeMemory."""
+        filename = self._sanitize_filename(title) + ".md"
+        filepath = self.path / filename
+        timestamp = datetime.now().isoformat()
+        full_content = f"# {title}\n\n{content}\n\n---\n*Created: {timestamp}*"
+        filepath.write_text(full_content)
+        return str(filepath)
+    
+    def read(self, title: str) -> Optional[str]:
+        """Read a memory file by title. Source: memory.tsx — readMemory."""
+        filepath = self.path / (self._sanitize_filename(title) + ".md")
+        if filepath.exists():
+            return filepath.read_text()
+        return None
+    
+    def list_all(self) -> List[str]:
+        """List all memory files. Source: memory.tsx — listMemories."""
+        return sorted([f.stem for f in self.path.glob("*.md")])
+    
+    def search(self, query: str) -> List[str]:
+        """Search memories by keyword. Source: memory.tsx — searchMemories."""
+        results = []
+        for f in self.path.glob("*.md"):
+            if query.lower() in f.read_text().lower():
+                results.append(f.stem)
+        return results
+    
+    @staticmethod
+    def _sanitize_filename(name: str) -> str:
+        """Convert a title to a safe filename."""
+        return "".join(c if c.isalnum() or c in " -_" else "_" for c in name).strip()
+```
+
+This file-based approach means memories **persist across sessions** and can be independently searched, edited, or deleted. It also means the memory system doesn't consume conversation tokens unless explicitly loaded.
+
 > **Next up: Chapter 07 — Long-Term Memory. We'll teach your agent to remember things across different conversations!**

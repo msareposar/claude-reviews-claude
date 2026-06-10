@@ -812,6 +812,151 @@ BasePlugin (abstract) → WeatherPlugin, TranslatorPlugin, etc.
 
 > **A plugin system separates WHAT the agent can do from HOW it does it. The agent focuses on deciding; plugins focus on executing. This is the foundation of extensible software.**
 
+### Behind the Code: How claude-code Integrates External Tools (MCP)
+
+The real **claude-code** ([sourcemap](https://github.com/ChinaSiro/claude-code-sourcemap)) supports the **Model Context Protocol (MCP)** — an open standard for adding external tools dynamically:
+
+**Source: [`restored-src/src/services/tools/toolOrchestration.ts`](https://github.com/ChinaSiro/claude-code-sourcemap/blob/main/restored-src/src/services/tools/toolOrchestration.ts)**
+
+Instead of a plugin manager that scans a folder, claude-code connects to **MCP servers** that advertise their own tools:
+
+```python
+# Conceptual model: MCP tool integration in claude-code
+# Source: restored-src/src/services/tools/toolOrchestration.ts
+
+from typing import Dict, List, Optional
+
+class MCPServer:
+    """
+    A remote tool server implementing the Model Context Protocol.
+    
+    MCP servers advertise their capabilities to the agent dynamically.
+    The agent discovers what tools are available at connection time.
+    """
+    def __init__(self, name: str, endpoint: str):
+        self.name = name
+        self.endpoint = endpoint
+        self.tools: Dict[str, dict] = {}
+    
+    def connect(self) -> bool:
+        """
+        Connect to the MCP server and discover its tools.
+        Claude-code calls this at startup for each configured server.
+        """
+        # In reality, this sends an MCP initialize request
+        print(f"🔌 Connecting to MCP server: {self.name} ({self.endpoint})")
+        return True
+    
+    def get_tool_schemas(self) -> List[dict]:
+        """
+        Get all tool schemas advertised by this server.
+        These are merged with built-in tools for the LLM to use.
+        """
+        return list(self.tools.values())
+
+
+class MCPToolRegistry:
+    """
+    Aggregates tools from multiple MCP servers + built-in tools.
+    
+    Claude-code merges all available tools (built-in + MCP) into
+    a single list that the LLM sees. The LLM doesn't know (or care)
+    which server provides each tool.
+    """
+    def __init__(self):
+        self.built_in_tools: Dict[str, callable] = {}
+        self.mcp_servers: List[MCPServer] = []
+    
+    def add_mcp_server(self, server: MCPServer) -> None:
+        """Register an MCP server. Tools from it become available."""
+        self.mcp_servers.append(server)
+    
+    def get_all_tool_schemas(self) -> List[dict]:
+        """Combine built-in tools + all MCP server tools."""
+        schemas = []
+        # Built-in tools
+        for name, fn in self.built_in_tools.items():
+            schemas.append(self._tool_to_schema(name, fn))
+        # MCP tools
+        for server in self.mcp_servers:
+            schemas.extend(server.get_tool_schemas())
+        return schemas
+    
+    def execute(self, tool_name: str, args: dict) -> str:
+        """Execute a tool, routing to the right provider."""
+        # Check built-in first
+        if tool_name in self.built_in_tools:
+            return self.built_in_tools[tool_name](**args)
+        # Try each MCP server
+        for server in self.mcp_servers:
+            if tool_name in server.tools:
+                # Route to MCP server
+                return self._call_mcp(server, tool_name, args)
+        return f"Error: Unknown tool '{tool_name}'"
+    
+    @staticmethod
+    def _tool_to_schema(name: str, fn: callable) -> dict:
+        """Generate OpenAI-compatible schema from a function."""
+        import inspect
+        sig = inspect.signature(fn)
+        props = {}
+        for param_name, param in sig.parameters.items():
+            props[param_name] = {
+                "type": "string",
+                "description": f"Parameter: {param_name}",
+            }
+        return {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": fn.__doc__ or "",
+                "parameters": {"type": "object", "properties": props},
+            },
+        }
+    
+    def _call_mcp(self, server: MCPServer, tool: str, args: dict) -> str:
+        """Execute a tool on an MCP server remotely."""
+        # In reality, this sends an MCP tools/call request
+        print(f"📡 Calling MCP tool {server.name}/{tool}")
+        return f"(mocked result from MCP tool '{tool}')"
+
+
+# ─── Usage: Plugins via MCP ───
+
+registry = MCPToolRegistry()
+
+# Built-in tools
+def search_web(query: str) -> str:
+    return f"Search results for: {query}"
+registry.built_in_tools["search_web"] = search_web
+
+# Connect MCP servers (external plugins)
+weather_mcp = MCPServer("weather", "http://localhost:8081/mcp")
+weather_mcp.tools = {
+    "get_weather": {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get weather for a city",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+            },
+        },
+    }
+}
+registry.add_mcp_server(weather_mcp)
+
+# Now the agent has both built-in + MCP tools combined
+all_tools = registry.get_all_tool_schemas()
+for t in all_tools:
+    print(f"📦 Available tool: {t['function']['name']}")
+```
+
+The key difference from our plugin system: MCP tools are **remote and dynamically discovered**. The agent connects to servers at runtime, gets their tool list, and can use them immediately without code changes. This is how claude-code supports extensions like database connectors, API integrations, and custom workflows — each MCP server contributes its own tools independently.
+
+For more details, see claude-code's [tool orchestration source](https://github.com/ChinaSiro/claude-code-sourcemap/blob/main/restored-src/src/services/tools/toolOrchestration.ts) and the `ToolSearchTool` for dynamic tool discovery.
+
 ### What's Next?
 
 In **[Chapter 12: Security & Permissions](./12-security.md)**, you'll learn how to protect your agent from attacks, limit what tools can do, and build a permission system that keeps your users safe.

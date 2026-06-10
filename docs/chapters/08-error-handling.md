@@ -406,4 +406,142 @@ Always try to help even when limited."""
 - **Clear user messages** — don't show raw errors to users
 - **Circuit breakers** — stop trying when something is clearly broken
 
+### Behind the Code: How claude-code Handles Errors
+
+The educational examples above use `try/except` for error handling. In the **real claude-code** ([sourcemap](https://github.com/ChinaSiro/claude-code-sourcemap)), errors are caught at the tool system level with typed results and permission checks:
+
+**Source: [`restored-src/src/Tool.ts`](https://github.com/ChinaSiro/claude-code-sourcemap/blob/main/restored-src/src/Tool.ts)**
+
+#### ValidationResult Pattern
+
+Every tool validates its input before execution, returning a structured result:
+
+```python
+# Conceptual model: claude-code's ValidationResult pattern
+# Source: restored-src/src/Tool.ts
+
+from typing import Generic, TypeVar, Union, Optional
+
+T = TypeVar('T')
+
+class ValidationSuccess:
+    """Input passed validation. Source: ValidationResult in Tool.ts"""
+    def __init__(self, result: bool = True):
+        self.valid = True
+
+class ValidationFailure:
+    """Input failed validation. Source: ValidationResult in Tool.ts"""
+    def __init__(self, message: str):
+        self.valid = False
+        self.message = message
+        # Claude-code also includes:
+        # self.error_code: str  # e.g., "invalid_file_path", "missing_required_field"
+
+ValidationResult = Union[ValidationSuccess, ValidationFailure]
+
+def validate_tool_input(tool_name: str, args: dict, schema: dict) -> ValidationResult:
+    """
+    Validate tool input before execution.
+    Mirrors how claude-code validates inputs before calling run().
+    """
+    for key, props in schema.get("properties", {}).items():
+        if props.get("required", False) and key not in args:
+            return ValidationFailure(f"Missing required parameter: {key}")
+        if key in args and "allowed_values" in props:
+            if args[key] not in props["allowed_values"]:
+                return ValidationFailure(
+                    f"Invalid value for {key}: '{args[key]}'. "
+                    f"Allowed: {props['allowed_values']}"
+                )
+    return ValidationSuccess()
+```
+
+#### Permission Gating with canUseTool
+
+Claude-code tools declare `canUseTool` to check permissions at runtime:
+
+```python
+# Conceptual model: claude-code's canUseTool permission system
+# Source: restored-src/src/Tool.ts
+
+class PermissionCheck:
+    """
+    Runtime permission check for tools.
+    
+    Claude-code checks:
+    - Is the tool enabled in the current context?
+    - Does the user's permission level allow this operation?
+    - Are there security constraints (sandbox, network, filesystem)?
+    """
+    def __init__(self, allowed: bool, reason: str = ""):
+        self.allowed = allowed
+        self.reason = reason
+
+class SafeTool:
+    """
+    A tool wrapper with permission and validation checks.
+    Mirrors how claude-code wraps tool execution with guards.
+    """
+    def __init__(self, name: str, call_fn, is_destructive: bool = False):
+        self.name = name
+        self._call = call_fn
+        self.is_destructive = is_destructive
+    
+    def check_permissions(self, context: dict) -> PermissionCheck:
+        """
+        Check if this tool can be used in the current context.
+        Source: Tool.ts — canUseTool
+        """
+        if self.is_destructive and context.get("dry_run", False):
+            return PermissionCheck(False, "Destructive tool blocked in dry-run mode")
+        return PermissionCheck(True)
+    
+    def safe_call(self, context: dict, **kwargs) -> str:
+        """Execute tool with full permission and validation checks."""
+        # 1. Permission check
+        perm = self.check_permissions(context)
+        if not perm.allowed:
+            return f"PermissionDenied: {perm.reason}"
+        
+        # 2. Validation check
+        validation = validate_tool_input(self.name, kwargs, {})
+        if not validation.valid:
+            return f"ValidationError: {validation.message}"
+        
+        # 3. Execute with error boundary
+        try:
+            return self._call(**kwargs)
+        except Exception as e:
+            # Claude-code wraps errors with FallbackToolUseErrorMessage
+            # Source: restored-src/src/components/FallbackToolUseErrorMessage.tsx
+            return (
+                f"tool_use_error\n"
+                f"Tool '{self.name}' encountered an error: {type(e).__name__}: {e}\n"
+                f"Suggested fix: Check the input parameters and try again."
+            )
+```
+
+#### Fallback Error Display
+
+When a tool fails, claude-code shows a structured error message the LLM can understand and retry from:
+
+```python
+# Claude-code wraps errors with the following pattern
+# Source: FallbackToolUseErrorMessage.tsx
+def format_tool_error(tool_name: str, error: str, context: dict) -> str:
+    """
+    Format a tool error so the LLM can understand what went wrong
+    and how to fix it.
+    """
+    return (
+        f"Tool Error — {tool_name}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"Type: {context.get('error_type', 'runtime')}\n"
+        f"Message: {error}\n"
+        f"Action: {'Check parameters and retry' if context.get('retryable', True) else 'Abort this approach'}"
+    )
+```
+
+The key insight from claude-code: **validation happens before execution** (input schema check) and **permission happens before validation** (canUseTool). This layered approach means the tool function itself rarely needs error handling — the guards catch everything upstream.
+
 > **Next up: Chapter 09 — Planning & Reasoning. How does your agent think through complex tasks?**

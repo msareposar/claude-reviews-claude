@@ -604,6 +604,101 @@ while step < max_steps:
     # LOOP: Go back to THINK
 ```
 
+### Behind the Code: How claude-code Runs the Loop
+
+The pattern above is the conceptual model. In the **real claude-code** ([sourcemap](https://github.com/ChinaSiro/claude-code-sourcemap)), the loop is more sophisticated — it uses streaming and a specialized executor:
+
+**Source: [`restored-src/src/services/tools/StreamingToolExecutor.ts`](https://github.com/ChinaSiro/claude-code-sourcemap/blob/main/restored-src/src/services/tools/StreamingToolExecutor.ts)**
+
+```python
+# Conceptual model of claude-code's streaming execution
+# Original: restored-src/src/query.ts, StreamingToolExecutor.ts
+
+from typing import List, Optional
+
+class ToolResult:
+    """Represents a single tool execution result, streamed back."""
+    def __init__(self, tool_name: str, success: bool, output: str, error: Optional[str] = None):
+        self.tool_name = tool_name
+        self.success = success
+        self.output = output
+        self.error = error
+
+class StreamingToolExecutor:
+    """
+    Executes tools with streaming and concurrency support.
+    
+    Key behaviors from the real claude-code:
+    - Partitions tools into concurrent-safe and unsafe groups
+    - Executes concurrent-safe tools in parallel
+    - Streams results back as they complete
+    - Handles permission checks via canUseTool
+    """
+    
+    def __init__(self, tools: dict):
+        self.tools = tools  # name → tool mapping
+        
+    def partition_tools(self, tool_calls: List[dict]) -> tuple:
+        """
+        Split tools into concurrent-safe and unsafe batches.
+        Safe tools run in parallel; unsafe tools run sequentially.
+        Source: StreamingToolExecutor.ts — constructor
+        """
+        safe = []
+        unsafe = []
+        for call in tool_calls:
+            tool = self.tools.get(call["name"])
+            if tool and getattr(tool, "is_concurrency_safe", True):
+                safe.append(call)
+            else:
+                unsafe.append(call)
+        return safe, unsafe
+    
+    def execute_batch(self, tool_calls: List[dict]) -> List[ToolResult]:
+        """
+        Execute a batch of tools. Safe tools run in parallel (simulated here),
+        while the real claude-code uses Promise.all() for concurrent execution.
+        """
+        results = []
+        for call in tool_calls:
+            tool = self.tools.get(call["name"])
+            if not tool:
+                results.append(ToolResult(call["name"], False, "", "Unknown tool"))
+                continue
+            try:
+                output = tool(**call.get("args", {}))
+                results.append(ToolResult(call["name"], True, output, None))
+            except Exception as e:
+                results.append(ToolResult(call["name"], False, "", str(e)))
+        return results
+    
+    def execute_all(self, tool_calls: List[dict]) -> List[ToolResult]:
+        """
+        Execute all tool calls with proper partitioning.
+        This mirrors how claude-code's runTools() orchestration works.
+        """
+        safe_calls, unsafe_calls = self.partition_tools(tool_calls)
+        
+        # Run safe tools concurrently (simulated)
+        safe_results = self.execute_batch(safe_calls)
+        
+        # Run unsafe tools one at a time
+        unsafe_results = []
+        for call in unsafe_calls:
+            result = self.execute_batch([call])[0]
+            unsafe_results.append(result)
+            
+        return safe_results + unsafe_results
+```
+
+Claude-code's actual execution also includes:
+
+- **Token budget tracking**: Monitors context window usage during the loop and triggers compaction when nearing the limit.
+- **`canUseTool` permission gating**: Each tool declares what permissions it needs, and claude-code checks them before execution ([source](https://github.com/ChinaSiro/claude-code-sourcemap/blob/main/restored-src/src/Tool.ts)).
+- **Streamed progress**: Intermediate progress is streamed back to the UI via `StreamingToolExecutor` events, not returned as a single block.
+
+The key difference from our simple loop: the real claude-code treats tool execution as a **streaming, permission-aware pipeline** rather than a synchronous function call chain.
+
 ### The Key Insight
 
 > **A single LLM call is not an agent. A loop that lets the LLM decide when to stop — that's an agent.**

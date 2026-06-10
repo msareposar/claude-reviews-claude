@@ -132,4 +132,96 @@ def agent_with_thinking_log(user_input: str) -> str:
 | 观察 | 把结果喂给 LLM | 添加 tool 消息 |
 | 重复 | 直到 LLM 不调用工具 | while 循环 |
 
+### 真实的 claude-code 是如何运行循环的？
+
+上面的模式是概念模型。在真实的 **claude-code**（[源码](https://github.com/ChinaSiro/claude-code-sourcemap)）中，循环更复杂——使用流式执行和专门的执行器：
+
+**源码：[`restored-src/src/services/tools/StreamingToolExecutor.ts`](https://github.com/ChinaSiro/claude-code-sourcemap/blob/main/restored-src/src/services/tools/StreamingToolExecutor.ts)**
+
+```python
+# claude-code 流式执行的概念模型
+# 原文：restored-src/src/query.ts, StreamingToolExecutor.ts
+
+from typing import List, Optional
+
+class ToolResult:
+    """表示一个工具执行结果，流式返回。"""
+    def __init__(self, tool_name: str, success: bool, output: str, error: Optional[str] = None):
+        self.tool_name = tool_name
+        self.success = success
+        self.output = output
+        self.error = error
+
+class StreamingToolExecutor:
+    """
+    支持流式和并发的工具执行器。
+    
+    真实 claude-code 的关键行为：
+    - 将工具分区为可并发和不可并发的组
+    - 可并发的工具并行执行
+    - 结果随着完成流式返回
+    - 通过 canUseTool 处理权限检查
+    """
+    
+    def __init__(self, tools: dict):
+        self.tools = tools  # name → tool 映射
+        
+    def partition_tools(self, tool_calls: List[dict]) -> tuple:
+        """
+        将工具划分为可并发和不可并发的批次。
+        安全的并行运行；不安全的串行运行。
+        源码：StreamingToolExecutor.ts — constructor
+        """
+        safe = []
+        unsafe = []
+        for call in tool_calls:
+            tool = self.tools.get(call["name"])
+            if tool and getattr(tool, "is_concurrency_safe", True):
+                safe.append(call)
+            else:
+                unsafe.append(call)
+        return safe, unsafe
+    
+    def execute_batch(self, tool_calls: List[dict]) -> List[ToolResult]:
+        """执行一批工具。安全的工具并行（模拟），真实 claude-code 使用 Promise.all()。"""
+        results = []
+        for call in tool_calls:
+            tool = self.tools.get(call["name"])
+            if not tool:
+                results.append(ToolResult(call["name"], False, "", "未知工具"))
+                continue
+            try:
+                output = tool(**call.get("args", {}))
+                results.append(ToolResult(call["name"], True, output, None))
+            except Exception as e:
+                results.append(ToolResult(call["name"], False, "", str(e)))
+        return results
+    
+    def execute_all(self, tool_calls: List[dict]) -> List[ToolResult]:
+        """
+        使用适当的分区执行所有工具调用。
+        这对应 claude-code 中 runTools() 的编排方式。
+        """
+        safe_calls, unsafe_calls = self.partition_tools(tool_calls)
+        
+        # 并行执行安全工具（模拟）
+        safe_results = self.execute_batch(safe_calls)
+        
+        # 串行执行不安全工具
+        unsafe_results = []
+        for call in unsafe_calls:
+            result = self.execute_batch([call])[0]
+            unsafe_results.append(result)
+            
+        return safe_results + unsafe_results
+```
+
+claude-code 的实际执行还包括：
+
+- **Token 预算跟踪**：监控循环期间的上下文窗口使用情况，接近限制时触发压缩。
+- **`canUseTool` 权限门控**：每个工具声明需要的权限，claude-code 在执行前检查（[源码](https://github.com/ChinaSiro/claude-code-sourcemap/blob/main/restored-src/src/Tool.ts)）。
+- **流式进度**：中间进度通过 `StreamingToolExecutor` 事件流式返回给 UI，而不是作为单个块返回。
+
+与我们简单循环的关键区别：真实的 claude-code 将工具执行视为一个**流式的、感知权限的管道**，而不是同步的函数调用链。
+
 下一章：给智能体装上一个完整的工具系统！
