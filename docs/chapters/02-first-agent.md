@@ -9,9 +9,9 @@
 By the end of this chapter, you will:
 
 - Understand what makes an agent different from a chatbot
-- Build a calculator tool your agent can use
+- Define a tool using **Schema + build_tool** (like claude-code's `buildTool(ToolDef)`)
 - Implement **function calling** (tool use) with an LLM
-- See how the LLM decides between answering directly or using a tool
+- Use **alias resolution** so the LLM can call tools by different names
 - Have a working agent that can answer questions AND do math
 
 ---
@@ -34,8 +34,8 @@ Think of it this way:
 ```
 Chatbot: User asks → LLM replies
 Agent:   User asks → LLM thinks → LLM decides: 
-                               ├─ "I can answer this" → replies directly
-                               └─ "I need a tool" → calls tool → gets result → replies
+                                ├─ "I can answer this" → replies directly
+                                └─ "I need a tool" → calls tool → gets result → replies
 ```
 
 ### Why Is This Hard?
@@ -80,84 +80,191 @@ The LLM never does the math itself. It just orchestrates the tool.
 
 ## 🔧 Hands-On: Build a Calculator Agent
 
-### Step 1: The Calculator Tool
+### Step 1: The Tool System Module
 
-First, let's build a simple calculator that can evaluate math expressions safely.
+First, let's build the reusable tool system that we'll use in every chapter. It mirrors how claude-code defines tools — Schema for validation, `build_tool(ToolDef)` for creation, and `ToolRegistry` with alias lookup.
 
-Create a file called `first_agent.py`:
+Create a file called `tool_system.py`:
+
+```python
+# tool_system.py — Reusable tool system (like claude-code's Tool.ts)
+# Source pattern: restored-src/src/Tool.ts
+
+from typing import Any, Dict, List, Optional, Tuple, Callable
+
+
+class Schema:
+    """
+    Validates tool inputs before execution.
+    Like claude-code's Zod schemas (source: restored-src/src/Tool.ts).
+    """
+    def __init__(self, properties: dict, required: list = None):
+        self.schema = {
+            "type": "object",
+            "properties": properties,
+            "required": required or [],
+        }
+    def validate(self, data: dict) -> Tuple[bool, Optional[str]]:
+        for key in self.schema["required"]:
+            if key not in data:
+                return False, f"Missing required field: '{key}'"
+        for key, value in data.items():
+            prop = self.schema["properties"].get(key)
+            if prop:
+                t = prop.get("type")
+                if t == "string" and not isinstance(value, str):
+                    return False, f"'{key}' must be a string"
+        return True, None
+    def to_json_schema(self):
+        return self.schema
+
+
+class Tool:
+    """
+    A tool object built from a ToolDef.
+    Like claude-code's Tool<Input, Output, P> type.
+    """
+    def __init__(self, name, description, input_schema, call_fn,
+                 is_concurrency_safe=True, aliases=None):
+        self.name = name
+        self.description = description
+        self.input_schema = input_schema
+        self._call = call_fn
+        self.is_concurrency_safe = is_concurrency_safe
+        self.aliases = aliases or []
+    def call(self, **kwargs) -> str:
+        is_valid, error = self.input_schema.validate(kwargs)
+        if not is_valid:
+            return f"ValidationError: {error}"
+        try:
+            return self._call(**kwargs)
+        except Exception as e:
+            return f"Error({type(e).__name__}): {e}"
+    def to_openai_schema(self):
+        return {"type": "function", "function": {
+            "name": self.name, "description": self.description,
+            "parameters": self.input_schema.to_json_schema(),
+        }}
+
+
+class ToolDef:
+    """
+    Definition used to build a Tool.
+    Like claude-code's ToolDef in restored-src/src/Tool.ts.
+    """
+    def __init__(self, name, description, input_schema, call,
+                 is_concurrency_safe=True, aliases=None):
+        self.name = name
+        self.description = description
+        self.input_schema = input_schema
+        self.call = call
+        self.is_concurrency_safe = is_concurrency_safe
+        self.aliases = aliases or []
+
+
+def build_tool(tool_def: ToolDef) -> Tool:
+    """
+    Build a Tool from a ToolDef.
+    Like claude-code's buildTool(ToolDef) in Tool.ts.
+    """
+    return Tool(tool_def.name, tool_def.description, tool_def.input_schema,
+                tool_def.call, tool_def.is_concurrency_safe, tool_def.aliases)
+
+
+class ToolRegistry:
+    """
+    Registry with alias lookup.
+    Like claude-code's findToolByName() pattern.
+    """
+    def __init__(self):
+        self._tools = {}
+    def register(self, tool: Tool):
+        self._tools[tool.name] = tool
+    def register_many(self, tools: list):
+        for t in tools: self.register(t)
+    def find_tool(self, name: str) -> Optional[Tool]:
+        """Find by canonical name or alias."""
+        tool = self._tools.get(name)
+        if tool: return tool
+        for t in self._tools.values():
+            if name in t.aliases: return t
+        return None
+    def run_tool(self, name: str, args: dict) -> str:
+        tool = self.find_tool(name)
+        if not tool: return f"Error: Unknown tool '{name}'"
+        return tool.call(**args)
+    def get_openai_schemas(self):
+        return [t.to_openai_schema() for t in self._tools.values()]
+```
+
+You'll save this file and import it into every agent you build. We'll keep adding to it in later chapters.
+
+### Step 2: Define the Calculator Tool
+
+Now let's use our tool system to define a calculator. We create a **Schema** for the input, write an **implementation function**, and call **build_tool(ToolDef)** — the same pattern claude-code uses.
+
+Create `first_agent.py`:
 
 ```python
 import math
 import json
+import os
+from openai import OpenAI
+from tool_system import Schema, Tool, ToolDef, build_tool, ToolRegistry
 
-# ─── THE TOOL ────────────────────────────────────────
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-def calculate(expression: str) -> str:
+# ─── 1. Define the input schema ──────────────────────
+
+calc_schema = Schema(
+    properties={
+        "expression": {
+            "type": "string",
+            "description": "The math expression to evaluate, e.g. '2 + 2' or '15 * 3.5'",
+        },
+    },
+    required=["expression"],
+)
+
+# ─── 2. Write the implementation function ────────────
+
+def calculate_impl(expression: str) -> str:
     """
-    Evaluate a mathematical expression.
-    
-    Args:
-        expression: A math expression like "2 + 2" or "15 * 3.5"
-    
-    Returns:
-        The result as a string
+    Evaluate a mathematical expression safely.
+    Only allows math operations — no file access, no system calls.
     """
-    # Create a safe evaluation environment
     allowed_names = {
         "abs": abs, "round": round, "max": max, "min": min,
         "sum": sum, "pow": pow, "sqrt": math.sqrt,
         "sin": math.sin, "cos": math.cos, "tan": math.tan,
         "pi": math.pi, "e": math.e,
     }
-    
-    try:
-        # Using eval is risky - we restrict it to only math operations
-        result = eval(expression, {"__builtins__": {}}, allowed_names)
-        return str(result)
-    except Exception as e:
-        return f"Error: {e}"
+    result = eval(expression, {"__builtins__": {}}, allowed_names)
+    return str(result)
 
-# Test it
-if __name__ == "__main__":
-    print(calculate("2 + 2"))          # "4"
-    print(calculate("15 * 3.5"))        # "52.5"
-    print(calculate("sqrt(144)"))       # "12.0"
-    print(calculate("sin(pi/2)"))       # "1.0"
+# ─── 3. Build the tool (like claude-code's buildTool) ───
+
+calculator = build_tool(ToolDef(
+    name="calculate",
+    description=(
+        "Evaluate a mathematical expression. "
+        "Supports: +, -, *, /, sqrt(), pow(), sin(), cos(), tan(), "
+        "pi, e, abs(), round(), min(), max()"
+    ),
+    input_schema=calc_schema,
+    call=calculate_impl,
+    is_concurrency_safe=True,
+    aliases=["calc", "math"],  # The LLM can also call it by these names
+))
+
+# ─── 4. Register with the registry ──────────────────
+
+registry = ToolRegistry()
+registry.register(calculator)
+
+# Get the OpenAI-compatible schema for the API
+tools_schema = registry.get_openai_schemas()
 ```
-
-> **Security note:** Using `eval()` is dangerous in production. We restrict it by removing dangerous built-ins. In later chapters, we'll build safer tools.
-
-### Step 2: Define the Tool Schema
-
-For the LLM to know about our tool, we need to describe it in a format the API understands. OpenAI uses a JSON schema:
-
-```python
-# ─── TOOL SCHEMA ──────────────────────────────────────
-
-calculator_schema = {
-    "type": "function",
-    "function": {
-        "name": "calculate",
-        "description": "Evaluate a mathematical expression. Use +, -, *, /, sqrt(), pow(), sin(), cos(), pi, e, etc.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "expression": {
-                    "type": "string",
-                    "description": "The math expression to evaluate, e.g. '2 + 2' or '15 * 3.5'",
-                }
-            },
-            "required": ["expression"],
-        },
-    },
-}
-```
-
-This tells the LLM:
-- There's a tool called **"calculate"**
-- It takes **one parameter**: an expression string
-- The parameter is **required**
-- Here's what the tool does
 
 ### Step 3: The Agent Loop
 
@@ -165,68 +272,69 @@ Now, let's write the agent loop. The agent:
 
 1. Takes a user's question
 2. Sends it to the LLM with the tool definitions
-3. If the LLM calls a tool → run the tool, send result back
+3. If the LLM calls a tool → run the tool via `registry.run_tool()`, send result back
 4. If the LLM replies directly → show the answer
 
 ```python
-from openai import OpenAI
-import os
-
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-def run_agent(user_input):
+def run_agent(user_input: str) -> str:
     """
     Run the agent with a user input.
-    Returns the final response.
+    Uses ToolRegistry to dispatch tool calls by name.
     """
     messages = [
-        {"role": "system", "content": "You are a helpful assistant with math skills. When you need to calculate something, use the calculate tool. Otherwise, answer directly."},
+        {
+            "role": "system",
+            "content": (
+                "You are a helpful assistant with access to a calculator tool. "
+                "When you need to calculate something, use the calculate tool. "
+                "Otherwise, answer directly."
+            ),
+        },
         {"role": "user", "content": user_input},
     ]
-    
+
     # First call to the LLM
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=messages,
-        tools=[calculator_schema],  # Tell the LLM about our tool
-        tool_choice="auto",         # Let the LLM decide when to use tools
+        tools=tools_schema,
+        tool_choice="auto",
     )
-    
+
     message = response.choices[0].message
-    
+
     # Check if the LLM wants to call a tool
     if message.tool_calls:
-        # The LLM asked to use a tool!
         tool_call = message.tool_calls[0]
         tool_name = tool_call.function.name
         tool_args = json.loads(tool_call.function.arguments)
-        
+
         print(f"🔧 LLM called tool: {tool_name}({tool_args})")
-        
-        # Run the tool
-        if tool_name == "calculate":
-            result = calculate(tool_args["expression"])
-        
+
+        # Run the tool via registry (with alias lookup!)
+        result = registry.run_tool(tool_name, tool_args)
+
         # Tell the LLM the result
-        messages.append(message)  # Add the assistant's tool call message
+        messages.append(message)
         messages.append({
             "role": "tool",
             "tool_call_id": tool_call.id,
             "content": result,
         })
-        
+
         # Get the final answer from the LLM
         final_response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=messages,
-            tools=[calculator_schema],
+            tools=tools_schema,
         )
-        
+
         return final_response.choices[0].message.content
-    
+
     else:
         # The LLM answered directly
         return message.content
+
 
 # ─── TRY IT ──────────────────────────────────────────
 
@@ -238,7 +346,7 @@ if __name__ == "__main__":
         "What's the capital of France?",
         "Calculate 15% of 200, then add 10.",
     ]
-    
+
     for q in questions:
         print(f"\n❓ You: {q}")
         answer = run_agent(q)
@@ -355,6 +463,32 @@ When the LLM decides to answer directly:
          └─────────────────┘
 ```
 
+### How build_tool + ToolDef Works
+
+Instead of writing tool schemas as raw dictionaries, claude-code uses a **definition → build** pattern:
+
+1. **ToolDef**: A simple bundle of tool metadata (name, description, schema, implementation, flags)
+2. **build_tool(ToolDef)**: Creates a Tool object with validation and error handling built in
+3. **ToolRegistry**: Holds all tools and resolves names via `find_tool()`
+
+This separation means:
+- The implementation function is a plain, testable function
+- The schema stays with the tool definition
+- Error handling and validation are automatic
+- Name resolution supports aliases
+
+### Why Aliases Matter
+
+Different LLMs (or the same LLM at different times) might try different names for the same conceptual tool. One might say `"calc"` while another says `"calculate"`. Without aliases, the call would fail. With aliases, `find_tool()` checks both the canonical name and the alias list.
+
+In claude-code, the Bash tool has aliases like `"shell"`, `"terminal"`, `"command"` — so even if the LLM doesn't guess the exact name, the tool is still found.
+
+### The Schema: Validation Before Execution
+
+The `Schema` class does more than describe inputs to the LLM. It also **validates** inputs before the tool runs. When you call `tool.call(expression=42)`, the Schema catches that `42` is not a string and returns a clear `ValidationError` instead of a cryptic crash.
+
+This is the same pattern claude-code uses: validate first, then execute. It means the tool implementation is always called with valid inputs.
+
 ### Why Function Calling Changes Everything
 
 Before function calling, if you wanted an LLM to do math, you had to:
@@ -376,7 +510,7 @@ An LLM can call **multiple tools** in one response. Each `tool_calls[i]` is a se
 
 Notice our system prompt:
 
-> "You are a helpful assistant with math skills. When you need to calculate something, use the calculate tool. Otherwise, answer directly."
+> "You are a helpful assistant with access to a calculator tool. When you need to calculate something, use the calculate tool. Otherwise, answer directly."
 
 This tells the LLM:
 1. ✅ You have a tool for math
@@ -391,65 +525,77 @@ Without this hint, the LLM might try to do math in its head (and get it wrong) o
 
 ### Exercise 1: Add a "Weather Tool"
 
-Create a fake weather tool that returns hardcoded temperatures for different cities. The schema:
+Create a weather tool using the same `build_tool(ToolDef)` pattern:
 
 ```python
-weather_schema = {
-    "type": "function",
-    "function": {
-        "name": "get_weather",
-        "description": "Get the current weather for a city.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "city": {
-                    "type": "string",
-                    "description": "City name, e.g. 'Tokyo', 'London'",
-                }
-            },
-            "required": ["city"],
+weather_schema = Schema(
+    properties={
+        "city": {
+            "type": "string",
+            "description": "City name, e.g. 'Tokyo', 'London'",
         },
     },
-}
-```
+    required=["city"],
+)
 
-The function:
-
-```python
-def get_weather(city: str) -> str:
+def get_weather_impl(city: str) -> str:
     """Fake weather data."""
     weather_data = {
         "Tokyo": "22°C, sunny",
         "London": "15°C, cloudy",
         "New York": "18°C, light rain",
         "Sydney": "26°C, clear",
-        "Mumbai": "32°C, humid",
     }
     return weather_data.get(city, f"20°C, unknown (no data for {city})")
+
+weather_tool = build_tool(ToolDef(
+    name="get_weather",
+    description="Get the current weather for a city.",
+    input_schema=weather_schema,
+    call=get_weather_impl,
+    is_concurrency_safe=True,
+    aliases=["weather", "forecast"],
+))
+
+registry.register(weather_tool)
 ```
 
 **Steps:**
-1. Add `weather_schema` to the `tools` list
-2. Add the tool handling logic in the agent loop
+1. Add the code above to `first_agent.py`
+2. Run `python first_agent.py` again
 3. Test with: "What's the weather in Tokyo?" and "What's 5 + 3 and weather in London?"
 
-### Exercise 2: Add a "Web Search" Tool (Simulated)
+### Exercise 2: Add a "Web Search" Tool
 
-Add another tool called `search_web` that returns simulated search results:
+Add a search tool using the same pattern:
 
 ```python
-def search_web(query: str) -> str:
-    """Simulated web search."""
+search_schema = Schema(
+    properties={
+        "query": {"type": "string", "description": "The search query"},
+    },
+    required=["query"],
+)
+
+def search_impl(query: str) -> str:
     fake_results = {
         "python programming": "Python is a high-level, interpreted programming language...",
         "AI agents": "AI agents are autonomous systems that perceive and act...",
         "capital of Japan": "Tokyo is the capital of Japan.",
     }
-    # Return a fake result or a default
     for key, value in fake_results.items():
         if key in query.lower():
             return value
-    return f"Search results for '{query}': (simulated) No results found, but here's a fun fact!"
+    return f"Search results for '{query}': (simulated) No results found."
+
+searcher = build_tool(ToolDef(
+    name="search_web",
+    description="Search the web for information.",
+    input_schema=search_schema,
+    call=search_impl,
+    is_concurrency_safe=True,
+    aliases=["search", "web"],
+))
 ```
 
 Make sure the agent uses `search_web` for knowledge questions and `calculate` for math questions.
@@ -487,7 +633,7 @@ Create an agent with **three** tools:
 2. `define_word` — returns a fake dictionary definition
 3. `translate` — returns a fake translation to Spanish
 
-Write the schemas, functions, and agent loop. Test with questions like:
+Use `build_tool(ToolDef)` for each. Test with:
 - "What's the square root of 256?"
 - "Define 'algorithm'"
 - "Translate 'hello' to Spanish"
@@ -499,123 +645,62 @@ Write the schemas, functions, and agent loop. Test with questions like:
 
 ### Key Concepts
 
-| Concept | What It Means |
-|---|---|
-| **Agent** | LLM + Tools (brain + hands) |
-| **Function calling** | The LLM outputs a structured request to use a tool |
-| **Tool schema** | A JSON description of a tool (name, params, description) |
-| **tool_choice** | Controls whether the LLM must/may/never use tools |
-| **Tool call** | The LLM's request to invoke a specific function |
-| **Tool result** | The output of the function, sent back to the LLM |
+| Concept | What It Means | In claude-code |
+|---|---|---|
+| **Schema** | Validates and describes tool inputs | `Zod` schemas in `Tool.ts` |
+| **ToolDef + build_tool** | Creates a Tool from a definition | `buildTool(ToolDef)` in `Tool.ts` |
+| **ToolRegistry** | Holds tools with alias lookup | `findToolByName()` in `Tool.ts` |
+| **Function calling** | The LLM outputs a structured request to use a tool | OpenAI/Anthropic API |
+| **Is_concurrency_safe** | Can this tool run in parallel? | `StreamingToolExecutor` |
+| **Aliases** | Alternative names for the same tool | `aliases` field in `Tool.ts` |
 
 ### The Code You Own
 
 ```python
-from openai import OpenAI
-import json
+from tool_system import Schema, Tool, ToolDef, build_tool, ToolRegistry
 
-client = OpenAI()
+# 1. Define schema
+calc_schema = Schema(
+    properties={"expression": {"type": "string", "description": "..."}},
+    required=["expression"],
+)
 
-def calculate(expression):
-    """A tool the agent can use."""
-    allowed = {"sqrt": math.sqrt, "pi": math.pi}
-    try:
-        return str(eval(expression, {"__builtins__": {}}, allowed))
-    except:
-        return f"Error"
+# 2. Write implementation
+def calc_impl(expression: str) -> str:
+    return str(eval(expression, {"__builtins__": {}}, {"sqrt": sqrt}))
 
-# Schema describing the tool
-calculator_schema = {
-    "type": "function",
-    "function": {
-        "name": "calculate",
-        "description": "Do math",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "expression": {"type": "string"}
-            },
-            "required": ["expression"],
-        },
-    },
-}
+# 3. Build tool (like claude-code's buildTool)
+calculator = build_tool(ToolDef(
+    name="calculate", description="Do math",
+    input_schema=calc_schema, call=calc_impl,
+    is_concurrency_safe=True, aliases=["calc"],
+))
 
-# Agent: LLM decides → we run tool → LLM answers
+# 4. Register
+registry = ToolRegistry()
+registry.register(calculator)
+
+# Agent: LLM decides → we dispatch → LLM answers
 def run_agent(user_input):
     messages = [
         {"role": "system", "content": "Use tools when needed."},
         {"role": "user", "content": user_input},
     ]
-    
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=messages,
-        tools=[calculator_schema],
+        model="gpt-4o-mini", messages=messages,
+        tools=registry.get_openai_schemas(),
     )
-    
     msg = response.choices[0].message
-    
     if msg.tool_calls:
-        # Run the tool
         args = json.loads(msg.tool_calls[0].function.arguments)
-        result = calculate(args["expression"])
-        # Send result back to LLM
+        result = registry.run_tool(msg.tool_calls[0].function.name, args)
         messages.append(msg)
         messages.append({"role": "tool", "tool_call_id": msg.tool_calls[0].id, "content": result})
-        final = client.chat.completions.create(model="gpt-4o-mini", messages=messages)
-        return final.choices[0].message.content
-    else:
-        return msg.content
+        return client.chat.completions.create(
+            model="gpt-4o-mini", messages=messages
+        ).choices[0].message.content
+    return msg.content
 ```
-
-### Behind the Code: How claude-code Names Its Tools
-
-In the **real claude-code** ([sourcemap](https://github.com/ChinaSiro/claude-code-sourcemap)), tool names follow a precise convention. Looking at the source:
-
-**Source: [`restored-src/src/Tool.ts`](https://github.com/ChinaSiro/claude-code-sourcemap/blob/main/restored-src/src/Tool.ts)**
-
-Each tool has:
-- **`name`**: The canonical name (e.g., `Bash`, `FileRead`, `Edit`)
-- **`aliases`**: Alternative names (e.g., `Bash` also responds to `shell`, `command`)
-- **`searchHint`**: A short description for tool search
-
-```python
-# Conceptual model: how claude-code defines tool names
-# Source: restored-src/src/Tool.ts
-
-class ToolDef:
-    def __init__(self, name: str, description: str, 
-                 aliases: list[str] = None,
-                 search_hint: str = ""):
-        self.name = name
-        self.description = description
-        self.aliases = aliases or []
-        self.search_hint = search_hint
-
-# Example: real claude-code tool name patterns
-tools = [
-    ToolDef(
-        name="Bash",
-        description="Run shell commands and get output",
-        aliases=["shell", "terminal", "command"],
-        search_hint="Execute CLI commands, scripts, programs",
-    ),
-    ToolDef(
-        name="FileRead",
-        description="Read files from the filesystem",
-        aliases=["read", "cat", "view"],
-        search_hint="View file contents, read code",
-    ),
-    ToolDef(
-        name="FileWrite",
-        description="Create and overwrite files",
-        aliases=["write", "create"],
-        search_hint="Save output, write to files",
-    ),
-]
-```
-
-The `aliases` system is important because different LLMs may try different names for the same conceptual tool. If an LLM says "I'll use `shell`" but the tool is named `Bash`, aliases ensure the right tool is still found. This mirrors how `findToolByName()` works in the real code — it checks both name and aliases before falling back to search.
 
 ### The Key Insight
 

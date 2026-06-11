@@ -10,9 +10,10 @@ By the end of this chapter, you will:
 
 - Understand the **Think → Act → Observe** loop that drives all agents
 - Build a `while` loop that keeps running until the agent decides to stop
+- Define tools with **ToolDef + build_tool** and dispatch via **ToolRegistry**
+- Use a **StreamingToolExecutor** with concurrent-safe partitioning
 - Handle **multi-step tasks** like "search, calculate, and summarize"
-- See how the agent plans its next step after each observation
-- Have a complete, runnable multi-step agent
+- Track **token budgets** and trigger compaction when nearing limits
 
 ---
 
@@ -68,9 +69,112 @@ Each step is one iteration of the loop. The agent keeps going until it decides i
 
 ## 🔧 Hands-On: Build the Core Loop
 
-### Step 1: Multiple Tools
+### Step 0: The Tool System Module
 
-First, let's give our agent a few tools so it can handle different tasks.
+First, let's create the tool system module that we'll use in every chapter. This uses the same patterns as claude-code — Schema for validation, ToolDef + build_tool for tool creation, and ToolRegistry with alias lookup.
+
+Create `tool_system.py`:
+
+```python
+# tool_system.py — Reusable tool system (like claude-code's Tool.ts)
+# Source pattern: restored-src/src/Tool.ts
+
+from typing import Any, Dict, List, Optional, Tuple, Callable
+
+
+class Schema:
+    """Validates tool inputs. Like claude-code's Zod schemas."""
+    def __init__(self, properties: dict, required: list = None):
+        self.schema = {
+            "type": "object",
+            "properties": properties,
+            "required": required or [],
+        }
+    def validate(self, data: dict) -> Tuple[bool, Optional[str]]:
+        for key in self.schema["required"]:
+            if key not in data:
+                return False, f"Missing required field: '{key}'"
+        for key, value in data.items():
+            prop = self.schema["properties"].get(key)
+            if prop:
+                t = prop.get("type")
+                if t == "string" and not isinstance(value, str):
+                    return False, f"'{key}' must be a string"
+        return True, None
+    def to_json_schema(self):
+        return self.schema
+
+
+class Tool:
+    """A tool object built from a ToolDef. Like claude-code's Tool type."""
+    def __init__(self, name, description, input_schema, call_fn,
+                 is_concurrency_safe=True, aliases=None):
+        self.name = name
+        self.description = description
+        self.input_schema = input_schema
+        self._call = call_fn
+        self.is_concurrency_safe = is_concurrency_safe
+        self.aliases = aliases or []
+    def call(self, **kwargs) -> str:
+        is_valid, error = self.input_schema.validate(kwargs)
+        if not is_valid:
+            return f"ValidationError: {error}"
+        try:
+            return self._call(**kwargs)
+        except Exception as e:
+            return f"Error({type(e).__name__}): {e}"
+    def to_openai_schema(self):
+        return {"type": "function", "function": {
+            "name": self.name, "description": self.description,
+            "parameters": self.input_schema.to_json_schema(),
+        }}
+
+
+class ToolDef:
+    """Definition used to build a Tool. Like claude-code's ToolDef."""
+    def __init__(self, name, description, input_schema, call,
+                 is_concurrency_safe=True, aliases=None):
+        self.name = name
+        self.description = description
+        self.input_schema = input_schema
+        self.call = call
+        self.is_concurrency_safe = is_concurrency_safe
+        self.aliases = aliases or []
+
+
+def build_tool(tool_def: ToolDef) -> Tool:
+    """Build a Tool from a ToolDef. Like claude-code's buildTool()."""
+    return Tool(tool_def.name, tool_def.description, tool_def.input_schema,
+                tool_def.call, tool_def.is_concurrency_safe, tool_def.aliases)
+
+
+class ToolRegistry:
+    """Registry with alias lookup. Like claude-code's findToolByName()."""
+    def __init__(self):
+        self._tools = {}
+    def register(self, tool: Tool):
+        self._tools[tool.name] = tool
+    def register_many(self, tools: list):
+        for t in tools: self.register(t)
+    def find_tool(self, name: str) -> Optional[Tool]:
+        tool = self._tools.get(name)
+        if tool: return tool
+        for t in self._tools.values():
+            if name in t.aliases: return t
+        return None
+    def run_tool(self, name: str, args: dict) -> str:
+        tool = self.find_tool(name)
+        if not tool: return f"Error: Unknown tool '{name}'"
+        return tool.call(**args)
+    def get_openai_schemas(self):
+        return [t.to_openai_schema() for t in self._tools.values()]
+    def concurrency_safe_tools(self):
+        return [t for t in self._tools.values() if t.is_concurrency_safe]
+```
+
+### Step 1: Define Tools with Schema + build_tool
+
+Now let's use the tool system to define our agent's tools. Each tool has a Schema, an implementation function, and gets built via `build_tool(ToolDef)`. This mirrors how claude-code defines tools in `Tool.ts`.
 
 Create `core_loop.py`:
 
@@ -79,23 +183,38 @@ import math
 import json
 import os
 from openai import OpenAI
+from tool_system import Schema, Tool, ToolDef, build_tool, ToolRegistry
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# ─── TOOLS ────────────────────────────────────────────
+# ─── DEFINE TOOLS (like claude-code's buildTool(ToolDef)) ────
 
-def calculate(expression: str) -> str:
-    """Evaluate a math expression."""
+calc_schema = Schema(
+    properties={
+        "expression": {
+            "type": "string",
+            "description": "The math expression to evaluate, e.g. '2 + 2'",
+        },
+    },
+    required=["expression"],
+)
+
+def calculate_impl(expression: str) -> str:
+    """Evaluate a mathematical expression."""
     allowed = {
         "abs": abs, "round": round, "sqrt": math.sqrt,
         "sin": math.sin, "cos": math.cos, "pi": math.pi, "e": math.e,
     }
-    try:
-        return str(eval(expression, {"__builtins__": {}}, allowed))
-    except Exception as e:
-        return f"Error: {e}"
+    return str(eval(expression, {"__builtins__": {}}, allowed))
 
-def search_web(query: str) -> str:
+search_schema = Schema(
+    properties={
+        "query": {"type": "string", "description": "The search query"},
+    },
+    required=["query"],
+)
+
+def search_impl(query: str) -> str:
     """Simulated web search."""
     fake_db = {
         "capital of france": "Paris is the capital of France.",
@@ -104,98 +223,181 @@ def search_web(query: str) -> str:
         "python language": "Python is a high-level, interpreted programming language created by Guido van Rossum in 1991.",
         "ai agent": "An AI agent is a system that uses an LLM to reason and call tools to accomplish tasks.",
     }
-    # Check for keyword matches
     for key, value in fake_db.items():
         if key in query.lower():
             return value
     return f"Search results for '{query}': No specific data found."
 
-def get_time() -> str:
-    """Get the current time (simulated)."""
+time_schema = Schema(properties={})
+
+def time_impl() -> str:
     from datetime import datetime
     return f"Current time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
 
-# ─── TOOL SCHEMAS ─────────────────────────────────────
+# ─── BUILD TOOLS (like claude-code's buildTool) ─────────────
 
-tools = [
-    {
-        "type": "function",
-        "function": {
-            "name": "calculate",
-            "description": "Evaluate a mathematical expression. Use +, -, *, /, sqrt(), pow(), sin(), cos(), pi, e, etc.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "expression": {
-                        "type": "string",
-                        "description": "The math expression to evaluate",
-                    }
-                },
-                "required": ["expression"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_web",
-            "description": "Search the web for information. Use for facts, definitions, and knowledge questions.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "The search query",
-                    }
-                },
-                "required": ["query"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_time",
-            "description": "Get the current date and time.",
-            "parameters": {
-                "type": "object",
-                "properties": {},
-            },
-        },
-    },
-]
+calculator = build_tool(ToolDef(
+    name="calculate",
+    description="Evaluate a mathematical expression. Use +, -, *, /, sqrt(), pow(), sin(), cos(), pi, e, etc.",
+    input_schema=calc_schema,
+    call=calculate_impl,
+    is_concurrency_safe=True,
+    aliases=["calc", "math"],
+))
 
-# ─── TOOL DISPATCHER ──────────────────────────────────
+searcher = build_tool(ToolDef(
+    name="search_web",
+    description="Search the web for information. Use for facts, definitions, and knowledge questions.",
+    input_schema=search_schema,
+    call=search_impl,
+    is_concurrency_safe=True,
+    aliases=["search", "web"],
+))
 
-def run_tool(tool_name: str, args: dict) -> str:
-    """Run a tool by name with the given arguments."""
-    if tool_name == "calculate":
-        return calculate(args["expression"])
-    elif tool_name == "search_web":
-        return search_web(args["query"])
-    elif tool_name == "get_time":
-        return get_time()
-    else:
-        return f"Unknown tool: {tool_name}"
+clock = build_tool(ToolDef(
+    name="get_time",
+    description="Get the current date and time.",
+    input_schema=time_schema,
+    call=time_impl,
+    is_concurrency_safe=True,
+))
+
+# ─── REGISTRY ───────────────────────────────────────────────
+
+registry = ToolRegistry()
+registry.register_many([calculator, searcher, clock])
+
+# OpenAI-compatible schemas for the LLM
+tools_schema = registry.get_openai_schemas()
 ```
 
-### Step 2: The Core Loop
+### Step 2: The StreamingToolExecutor
 
-Now let's build the **Think → Act → Observe** loop:
+In claude-code, the `StreamingToolExecutor` partitions tools by concurrency safety and streams results back. Let's build our version:
+
+```python
+# ─── STREAMING TOOL EXECUTOR (like claude-code's StreamingToolExecutor.ts) ──
+
+class ToolResult:
+    """A single tool execution result, ready to be streamed back."""
+    def __init__(self, tool_name: str, output: str, success: bool = True):
+        self.tool_name = tool_name
+        self.output = output
+        self.success = success
+
+class StreamingToolExecutor:
+    """
+    Executes tools with concurrency support.
+    
+    Like claude-code's StreamingToolExecutor (source:
+    restored-src/src/services/tools/StreamingToolExecutor.ts).
+    Partitions tools into concurrent-safe and sequential batches.
+    """
+    def __init__(self, registry: ToolRegistry):
+        self.registry = registry
+
+    def partition_tools(self, tool_calls: list) -> tuple:
+        """
+        Partition tool calls into concurrent-safe and sequential groups.
+        Safe tools can run in parallel; unsafe tools run one at a time.
+        """
+        safe = []
+        unsafe = []
+        for tc in tool_calls:
+            tool = self.registry.find_tool(tc["name"])
+            if tool and tool.is_concurrency_safe:
+                safe.append(tc)
+            else:
+                unsafe.append(tc)
+        return safe, unsafe
+
+    def execute(self, tool_calls: list) -> List[ToolResult]:
+        """
+        Execute all tool calls with partitioning.
+        Safe batch runs in parallel (simulated here); unsafe runs sequentially.
+        """
+        safe_calls, unsafe_calls = self.partition_tools(tool_calls)
+
+        # Run concurrent-safe tools in parallel (simulated)
+        safe_results = [self._run_one(c) for c in safe_calls]
+
+        # Run unsafe tools one at a time
+        unsafe_results = [self._run_one(c) for c in unsafe_calls]
+
+        return safe_results + unsafe_results
+
+    def _run_one(self, tc: dict) -> ToolResult:
+        """Execute a single tool call."""
+        output = self.registry.run_tool(tc["name"], tc.get("args", {}))
+        return ToolResult(tc["name"], output)
+
+executor = StreamingToolExecutor(registry)
+```
+
+### Step 3: Context Manager with Token Budget
+
+Claude-code tracks context window usage and triggers **auto-compaction** when nearing the limit. Let's add a simple version:
+
+```python
+# ─── CONTEXT MANAGER (like claude-code's auto-compaction) ────
+
+class ContextManager:
+    """
+    Tracks token usage and triggers compaction when needed.
+    
+    Like claude-code's compact service (source:
+    restored-src/src/services/compact/compact.ts).
+    """
+    def __init__(self, max_tokens: int = 128000):
+        self.max_tokens = max_tokens
+        self.compaction_threshold = int(max_tokens * 0.75)
+
+    def check_budget(self, current_tokens: int) -> dict:
+        """
+        Check token budget and return status.
+        
+        Returns:
+            {"ok": True} — still within budget
+            {"ok": False, "action": "compact"} — nearing limit, should compact
+        """
+        remaining = self.max_tokens - current_tokens
+        if current_tokens > self.compaction_threshold:
+            return {"ok": False, "action": "compact",
+                    "message": f"Context at {current_tokens}/{self.max_tokens} tokens. Compacting..."}
+        return {"ok": True, "remaining": remaining}
+
+    def compact(self, messages: list) -> list:
+        """
+        Compact messages by summarizing older turns.
+        Keeps system prompt + most recent exchanges verbatim.
+        """
+        system_msgs = [m for m in messages if m["role"] == "system"]
+        # Keep last 2 exchanges (4 messages) verbatim
+        recent = messages[-4:] if len(messages) > 4 else messages
+        old = messages[len(system_msgs):-4] if len(messages) > 4 else []
+
+        if not old:
+            return messages
+
+        summary = f"[Context compacted: {len(old)} older messages summarized]"
+        return system_msgs + [
+            {"role": "system", "content": summary}
+        ] + recent
+
+ctx = ContextManager(max_tokens=128000)
+```
+
+### Step 4: The Core Loop
+
+Now let's build the **Think → Act → Observe** loop using our tool system. This mirrors how claude-code's `query.ts` orchestrates the agent:
 
 ```python
 # ─── THE CORE LOOP ────────────────────────────────────
 
 def run_agent(user_input: str, max_steps: int = 10) -> str:
     """
-    Run the agent with the Think → Act → Observe loop.
-    
-    Args:
-        user_input: The user's request
-        max_steps: Maximum iterations to prevent infinite loops
-    
-    Returns:
-        The agent's final response
+    Run the agent with Think → Act → Observe loop.
+    Uses ToolRegistry, StreamingToolExecutor, and ContextManager.
     """
     messages = [
         {
@@ -213,58 +415,73 @@ def run_agent(user_input: str, max_steps: int = 10) -> str:
         },
         {"role": "user", "content": user_input},
     ]
-    
+
     step = 0
-    
+    total_tokens = 0
+
     while step < max_steps:
         step += 1
         print(f"\n{'='*50}")
         print(f"🔄 Step {step}: Thinking...")
-        
+
         # ─── THINK ────────────────────────────────────
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=messages,
-            tools=tools,
+            tools=tools_schema,
         )
-        
+
+        # Track token usage
+        if hasattr(response, 'usage') and response.usage:
+            total_tokens += response.usage.total_tokens
+            print(f"📊 Total tokens used so far: {total_tokens}")
+
         message = response.choices[0].message
-        
+
+        # ─── CHECK BUDGET ─────────────────────────────
+        budget = ctx.check_budget(total_tokens)
+        if not budget["ok"]:
+            print(f"⚠️ {budget['message']}")
+            messages = ctx.compact(messages)
+
         # ─── CHECK IF DONE ────────────────────────────
         if not message.tool_calls:
-            # No tool calls = the agent is done
             print(f"✅ Agent decided it's done.")
             print(f"💬 Final response: {message.content}")
             return message.content
-        
+
         # ─── ACT ──────────────────────────────────────
-        # Process each tool call
         messages.append(message)
-        
-        for tool_call in message.tool_calls:
-            tool_name = tool_call.function.name
-            args = json.loads(tool_call.function.arguments)
-            
-            print(f"🔧 Act: Calling {tool_name}({args})")
-            
-            # Run the tool
-            result = run_tool(tool_name, args)
-            print(f"👀 Observe: Got result: {result[:80]}...")
-            
-            # ─── OBSERVE ──────────────────────────────
+
+        # Convert OpenAI tool calls to our format
+        tool_calls = []
+        for tc in message.tool_calls:
+            tool_calls.append({
+                "name": tc.function.name,
+                "args": json.loads(tc.function.arguments),
+            })
+            print(f"🔧 Act: Calling {tc.function.name}({tc.function.arguments})")
+
+        # Execute via StreamingToolExecutor (with partitioning)
+        results = executor.execute(tool_calls)
+
+        # ─── OBSERVE ──────────────────────────────────
+        for i, (tc, result) in enumerate(zip(message.tool_calls, results)):
+            print(f"👀 Observe: {result.output[:80]}...")
             messages.append({
                 "role": "tool",
-                "tool_call_id": tool_call.id,
-                "content": result,
+                "tool_call_id": tc.id,
+                "content": result.output,
             })
-    
+
     # If we hit max_steps, force a final answer
     print(f"⚠️ Hit max steps ({max_steps}). Forcing final answer.")
     messages.append({
         "role": "system",
-        "content": "You have reached the maximum number of steps. Please provide your best answer now based on what you've done so far."
+        "content": "You have reached the maximum number of steps. "
+                   "Please provide your best answer now based on what you've done so far."
     })
-    
+
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=messages,
@@ -281,7 +498,7 @@ if __name__ == "__main__":
         "Search the web for the population of Japan, then calculate what 10% of that is.",
         "What's the weather in Tokyo? Also, what time is it?",
     ]
-    
+
     for task in test_tasks:
         print(f"\n\n{'#'*60}")
         print(f"❓ USER: {task}")
@@ -290,7 +507,7 @@ if __name__ == "__main__":
         print(f"\n📨 FINAL: {result}")
 ```
 
-### Step 3: Run It
+### Step 5: Run It
 
 ```bash
 python core_loop.py
@@ -299,7 +516,7 @@ python core_loop.py
 Watch the output carefully. You'll see the agent:
 
 1. **Think** about the task
-2. **Act** by calling a tool
+2. **Act** by calling a tool via the `StreamingToolExecutor`
 3. **Observe** the result
 4. **Repeat** if more work is needed
 
@@ -312,16 +529,19 @@ Example output for "Search the web for the population of Japan, then calculate w
 
 ==================================================
 🔄 Step 1: Thinking...
-🔧 Act: Calling search_web({'query': 'population of Japan'})
-👀 Observe: Got result: Japan's population is approximately 125 million (2024 estimate)....
+📊 Total tokens used so far: 412
+🔧 Act: Calling search_web({"query":"population of Japan"})
+👀 Observe: Japan's population is approximately 125 million (2024 estimate)....
 
 ==================================================
 🔄 Step 2: Thinking...
-🔧 Act: Calling calculate({'expression': '125000000 * 0.1'})
-👀 Observe: Got result: 12500000.0....
+📊 Total tokens used so far: 678
+🔧 Act: Calling calculate({"expression":"125000000 * 0.1"})
+👀 Observe: 12500000.0....
 
 ==================================================
 🔄 Step 3: Thinking...
+📊 Total tokens used so far: 823
 ✅ Agent decided it's done.
 💬 Final response: Japan's population is approximately 125 million, and 10% of that is 12.5 million.
 ```
@@ -366,16 +586,38 @@ The core loop is a simple state machine:
              └──→ BACK TO THINK ──┘
 ```
 
-### Why the Loop Matters
+### How the Pieces Connect
 
-Without a loop, your agent can only do **one thing**. With a loop, it can:
+Our agent uses three claude-code-inspired layers:
 
-| Before (single call) | After (loop) |
-|---|---|
-| Answer or call 1 tool | Call many tools in sequence |
-| No chain of thought | Step-by-step reasoning |
-| Can't recover from errors | Can retry or try alternatives |
-| Fixed, one-shot | Dynamic, until done |
+| Layer | Our Code | In claude-code |
+|---|---|---|
+| **Tool Definition** | `Schema` + `build_tool(ToolDef)` | `restored-src/src/Tool.ts` |
+| **Tool Registry** | `ToolRegistry.find_tool()` with alias lookup | `findToolByName()` |
+| **Execution** | `StreamingToolExecutor` with concurrency partitioning | `StreamingToolExecutor.ts` |
+| **Context** | `ContextManager` with token budget + compaction | `compact.ts` |
+
+### Why Three Separate Layers?
+
+Each layer handles one concern:
+- **Tool System**: How tools are defined and validated
+- **Executor**: How tools are run (parallel vs sequential)
+- **Context Manager**: How the conversation stays within limits
+
+This separation mirrors claude-code's architecture. It makes each part testable and replaceable.
+
+### Partitioning: Safe vs Unsafe Tools
+
+When the LLM calls multiple tools in one step, our `StreamingToolExecutor` checks `is_concurrency_safe` on each tool:
+
+- **`is_concurrency_safe=True`**: No side effects, can run in parallel (calculations, searches, reads)
+- **`is_concurrency_safe=False`**: Has side effects, must run sequentially (file writes, state changes)
+
+Safe tools all run at once (simulated with a loop; in claude-code they use `Promise.all()`). Unsafe tools run one at a time to avoid race conditions.
+
+### Token Budget Tracking
+
+As the agent loops, the conversation grows. Every tool call and result adds tokens. Our `ContextManager` tracks usage and warns when approaching the limit. In claude-code, this triggers auto-compaction — older exchanges get summarized to free up space.
 
 ### Understand the Think Phase
 
@@ -383,7 +625,7 @@ During the **Think** phase, the LLM sees:
 
 1. The system message (instructions)
 2. All previous conversation (user, assistant, tool results)
-3. The tool definitions
+3. The tool definitions (from `registry.get_openai_schemas()`)
 
 It then decides:
 
@@ -413,7 +655,7 @@ The LLM might reply with **two tool calls** at once:
 ]
 ```
 
-Our loop handles this by iterating over `message.tool_calls` and running each one.
+Our `StreamingToolExecutor` handles this by partitioning and executing them efficiently.
 
 ### Handling Max Steps
 
@@ -456,39 +698,33 @@ Each observation **changes the context** for the next Think phase.
 
 ## 🧪 Exercises
 
-### Exercise 1: Add a File Writing Tool
+### Exercise 1: Add a File Writing Tool (with concurrency flag)
 
-Add a tool that writes text to a file. The agent can then save results.
-
-```python
-def write_file(filename: str, content: str) -> str:
-    """Write content to a file."""
-    try:
-        with open(filename, 'w') as f:
-            f.write(content)
-        return f"Successfully wrote {len(content)} characters to {filename}"
-    except Exception as e:
-        return f"Error writing file: {e}"
-```
-
-Add the schema:
+Add a tool that writes text to a file. Since writing is a side effect, it should **not** be concurrency-safe:
 
 ```python
-{
-    "type": "function",
-    "function": {
-        "name": "write_file",
-        "description": "Write text content to a file.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "filename": {"type": "string", "description": "Name of the file"},
-                "content": {"type": "string", "description": "Content to write"},
-            },
-            "required": ["filename", "content"],
-        },
+write_schema = Schema(
+    properties={
+        "filename": {"type": "string", "description": "Name of the file"},
+        "content": {"type": "string", "description": "Content to write"},
     },
-}
+    required=["filename", "content"],
+)
+
+def write_file_impl(filename: str, content: str) -> str:
+    with open(filename, 'w') as f:
+        f.write(content)
+    return f"Successfully wrote {len(content)} characters to {filename}"
+
+writer = build_tool(ToolDef(
+    name="write_file",
+    description="Write text content to a file.",
+    input_schema=write_schema,
+    call=write_file_impl,
+    is_concurrency_safe=False,  # ⚠️ Side effects: must run sequentially
+))
+
+registry.register(writer)
 ```
 
 **Test:** "Search for information about Python, then save a summary to python_info.txt"
@@ -503,48 +739,46 @@ Create a task that requires **three** sequential tool calls:
 
 Observe how the agent plans and executes all three steps.
 
-### Exercise 3: Error Recovery
+### Exercise 3: Watch the Concurrency Partitioning
 
-Make the `calculate` tool fail sometimes (simulate an error):
-
-```python
-def calculate(expression: str) -> str:
-    if "error" in expression.lower():
-        return "Error: Invalid expression. Please try again with proper syntax."
-    # ... normal calculation
-```
-
-Ask the agent: "Calculate error_test" and see how the LLM handles the error. Does it try again with a different expression? Does it apologize and give up?
-
-Modify your system prompt to encourage retrying on errors:
-
-```
-"When a tool returns an error, try to fix the issue and retry."
-```
-
-### Exercise 4: Limit the Steps to 2
-
-Change `max_steps = 2` and ask a task that needs 3 steps. Watch what happens. The agent should be forced to give its best answer even if the task isn't complete.
-
-### Exercise 5: Track the Token Usage
-
-Add token tracking to see how much each step costs:
+Add debug output to see how the executor partitions tool calls:
 
 ```python
-response = client.chat.completions.create(...)
-prompt_tokens = response.usage.prompt_tokens
-completion_tokens = response.usage.completion_tokens
-total_tokens = response.usage.total_tokens
-print(f"📊 Tokens used: {total_tokens} (prompt: {prompt_tokens}, completion: {completion_tokens})")
+# Add inside execute():
+print(f"  ⚡ Safe batch: {[c['name'] for c in safe_calls]}")
+print(f"  🔒 Sequential: {[c['name'] for c in unsafe_calls]}")
 ```
 
-Run a multi-step task and see how many tokens the whole conversation uses.
+Test with a task that triggers multiple concurrent calls.
+
+### Exercise 4: Test Alias Resolution
+
+Use an alias instead of the canonical tool name. The registry should still find it:
+
+```python
+# "search" is an alias for "search_web"
+response = registry.run_tool("search", {"query": "capital of france"})
+print(response)  # Should work!
+```
+
+### Exercise 5: Track Token Usage per Step
+
+Modify the loop to track prompt vs completion tokens:
+
+```python
+usage = response.usage
+print(f"📊 Prompt: {usage.prompt_tokens} | "
+      f"Completion: {usage.completion_tokens} | "
+      f"Total: {usage.total_tokens}")
+```
+
+Run a multi-step task and see how the token costs add up.
 
 ### Challenge: Build a "Research Assistant"
 
 Create an agent with these tools:
 1. `search_web` — for facts
-2. `calculate` — for math  
+2. `calculate` — for math
 3. `write_file` — to save results
 4. `get_time` — for timestamps
 
@@ -563,141 +797,52 @@ Watch the agent plan and execute this complex task!
 
 ### Key Concepts
 
-| Concept | What It Means |
-|---|---|
-| **Think** | The LLM looks at context and decides what to do |
-| **Act** | Call a tool with specific arguments |
-| **Observe** | Process the tool's result and add it to context |
-| **Loop** | Repeat Think → Act → Observe until done |
-| **Max steps** | Safety limit to prevent infinite loops |
-| **Multi-step** | Breaking a complex task into sequential tool calls |
+| Concept | What It Means | In claude-code |
+|---|---|---|
+| **Think** | The LLM looks at context and decides what to do | `query.ts` |
+| **Act** | Call a tool with specific arguments | `runTools()` |
+| **Observe** | Process the tool's result and add it to context | message append |
+| **Loop** | Repeat Think → Act → Observe until done | main agent loop |
+| **StreamingToolExecutor** | Partitions tools by concurrency safety | `StreamingToolExecutor.ts` |
+| **ContextManager** | Tracks token budget, triggers compaction | `compact.ts` |
+| **Max steps** | Safety limit to prevent infinite loops | `maxIterations` |
 
 ### The Core Loop Pattern
 
 ```python
-messages = [
-    {"role": "system", "content": system_prompt},
-    {"role": "user", "content": user_input},
-]
+from tool_system import Schema, Tool, ToolDef, build_tool, ToolRegistry
+
+# 1. Define tools with Schema + build_tool(ToolDef)
+calc = build_tool(ToolDef(name="calculate", ..., call=calculate_impl))
+registry = ToolRegistry()
+registry.register_many([calc, ...])
+
+# 2. Create executor and context manager
+executor = StreamingToolExecutor(registry)
+ctx = ContextManager(max_tokens=128000)
+
+# 3. The loop
+messages = [{"role": "system", "content": prompt}, {"role": "user", "content": input}]
 
 while step < max_steps:
-    # THINK: Ask the LLM
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=messages,
-        tools=tools,
-    )
-    
+    # THINK
+    response = client.chat.completions.create(model="...", messages=messages, tools=tools)
+
+    # CHECK BUDGET
+    if not ctx.check_budget(total_tokens)["ok"]:
+        messages = ctx.compact(messages)
+
+    # CHECK DONE
+    if not response.choices[0].message.tool_calls:
+        return response.choices[0].message.content
+
+    # ACT + OBSERVE (via StreamingToolExecutor)
     msg = response.choices[0].message
-    
-    # CHECK: Is the agent done?
-    if not msg.tool_calls:
-        return msg.content  # Done!
-    
-    # ACT: Run each tool
     messages.append(msg)
-    for tc in msg.tool_calls:
-        result = run_tool(tc.function.name, json.loads(tc.function.arguments))
-        # OBSERVE: Add result to context
-        messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
-    
-    # LOOP: Go back to THINK
+    results = executor.execute(tool_calls)
+    for tc, result in zip(msg.tool_calls, results):
+        messages.append({"role": "tool", "tool_call_id": tc.id, "content": result.output})
 ```
-
-### Behind the Code: How claude-code Runs the Loop
-
-The pattern above is the conceptual model. In the **real claude-code** ([sourcemap](https://github.com/ChinaSiro/claude-code-sourcemap)), the loop is more sophisticated — it uses streaming and a specialized executor:
-
-**Source: [`restored-src/src/services/tools/StreamingToolExecutor.ts`](https://github.com/ChinaSiro/claude-code-sourcemap/blob/main/restored-src/src/services/tools/StreamingToolExecutor.ts)**
-
-```python
-# Conceptual model of claude-code's streaming execution
-# Original: restored-src/src/query.ts, StreamingToolExecutor.ts
-
-from typing import List, Optional
-
-class ToolResult:
-    """Represents a single tool execution result, streamed back."""
-    def __init__(self, tool_name: str, success: bool, output: str, error: Optional[str] = None):
-        self.tool_name = tool_name
-        self.success = success
-        self.output = output
-        self.error = error
-
-class StreamingToolExecutor:
-    """
-    Executes tools with streaming and concurrency support.
-    
-    Key behaviors from the real claude-code:
-    - Partitions tools into concurrent-safe and unsafe groups
-    - Executes concurrent-safe tools in parallel
-    - Streams results back as they complete
-    - Handles permission checks via canUseTool
-    """
-    
-    def __init__(self, tools: dict):
-        self.tools = tools  # name → tool mapping
-        
-    def partition_tools(self, tool_calls: List[dict]) -> tuple:
-        """
-        Split tools into concurrent-safe and unsafe batches.
-        Safe tools run in parallel; unsafe tools run sequentially.
-        Source: StreamingToolExecutor.ts — constructor
-        """
-        safe = []
-        unsafe = []
-        for call in tool_calls:
-            tool = self.tools.get(call["name"])
-            if tool and getattr(tool, "is_concurrency_safe", True):
-                safe.append(call)
-            else:
-                unsafe.append(call)
-        return safe, unsafe
-    
-    def execute_batch(self, tool_calls: List[dict]) -> List[ToolResult]:
-        """
-        Execute a batch of tools. Safe tools run in parallel (simulated here),
-        while the real claude-code uses Promise.all() for concurrent execution.
-        """
-        results = []
-        for call in tool_calls:
-            tool = self.tools.get(call["name"])
-            if not tool:
-                results.append(ToolResult(call["name"], False, "", "Unknown tool"))
-                continue
-            try:
-                output = tool(**call.get("args", {}))
-                results.append(ToolResult(call["name"], True, output, None))
-            except Exception as e:
-                results.append(ToolResult(call["name"], False, "", str(e)))
-        return results
-    
-    def execute_all(self, tool_calls: List[dict]) -> List[ToolResult]:
-        """
-        Execute all tool calls with proper partitioning.
-        This mirrors how claude-code's runTools() orchestration works.
-        """
-        safe_calls, unsafe_calls = self.partition_tools(tool_calls)
-        
-        # Run safe tools concurrently (simulated)
-        safe_results = self.execute_batch(safe_calls)
-        
-        # Run unsafe tools one at a time
-        unsafe_results = []
-        for call in unsafe_calls:
-            result = self.execute_batch([call])[0]
-            unsafe_results.append(result)
-            
-        return safe_results + unsafe_results
-```
-
-Claude-code's actual execution also includes:
-
-- **Token budget tracking**: Monitors context window usage during the loop and triggers compaction when nearing the limit.
-- **`canUseTool` permission gating**: Each tool declares what permissions it needs, and claude-code checks them before execution ([source](https://github.com/ChinaSiro/claude-code-sourcemap/blob/main/restored-src/src/Tool.ts)).
-- **Streamed progress**: Intermediate progress is streamed back to the UI via `StreamingToolExecutor` events, not returned as a single block.
-
-The key difference from our simple loop: the real claude-code treats tool execution as a **streaming, permission-aware pipeline** rather than a synchronous function call chain.
 
 ### The Key Insight
 
@@ -707,7 +852,7 @@ The loop is the engine. It gives the LLM the ability to iterate, correct itself,
 
 ### What's Next?
 
-In **[Chapter 04: Tool System: Hands & Feet](./04-tool-system.md)**, you'll stop writing tools as loose functions. You'll build a proper **tool system** — an abstract base class, schema generation, error handling, and registration. Your agent will be easier to extend with new capabilities.
+In **[Chapter 04: Tool System: Hands & Feet](./04-tool-system.md)**, you'll dive deeper into the tool system we started here — Schema validation, alias-based dispatch, concurrency control, and a complete tool lifecycle. You'll build a full production-ready tool system.
 
 ---
 

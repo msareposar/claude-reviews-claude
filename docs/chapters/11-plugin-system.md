@@ -1,6 +1,6 @@
 # 11. Plugin System
 
-> **In this chapter: Your agent is powerful, but you can't predict every tool someone might need. You'll build a plugin system — a way to add new capabilities without touching the agent's core code. This is how real-world software stays extensible.**
+> **In this chapter: Your agent is powerful, but you can't predict every tool someone might need. You'll build a plugin system using the Model Context Protocol (MCP) pattern — the same approach claude-code uses to integrate external tools dynamically.**
 
 ---
 
@@ -8,12 +8,11 @@
 
 By the end of this chapter, you will:
 
-- Understand why plugins are better than hard-coding every feature
-- Design a **plugin interface** (abstract base class) that all plugins follow
-- Build a **plugin manager** that discovers, loads, and runs plugins
-- Create example plugins: a weather plugin, a translator plugin, and an image gen plugin
-- See how plugins register themselves and expose configuration options
-- Have a complete, extensible plugin system you can reuse in any agent
+- Understand why dynamic tool discovery beats hard-coding
+- Build an **MCPServer** — a remote tool provider that advertises its capabilities
+- Build an **MCPToolRegistry** that merges built-in and external tools
+- Create example MCP servers: weather, translator, and a simple API
+- See how tools are discovered at runtime without code changes
 
 ---
 
@@ -28,753 +27,615 @@ You've built a great agent. It can search the web, do math, and read files. But 
 - Generate an image?
 - Control their smart home lights?
 
-You could add each feature directly into the agent's code. But that means:
-
-1. You edit the **core agent** every time
-2. One buggy feature could break the whole agent
-3. You need to redeploy the entire agent for each new feature
-4. Other people can't add their own features
-
-**This is bad software design.**
-
-### The Solution: Plugins
-
-A **plugin** is a self-contained piece of code that adds a specific capability. It's like a USB device — you plug it in, and it just works.
+You could add each feature directly to the agent's code. But that means:
 
 ```
-Agent Core (the hub)
-    │
-    ├── USB port 1: Weather Plugin ← Just plug in!
-    ├── USB port 2: Translator Plugin ← Just plug in!
-    ├── USB port 3: Image Gen Plugin ← Just plug in!
-    └── USB port 4: Your Custom Plugin ← Your own!
+Week 1: User wants weather  →  Add weather function
+Week 2: User wants translate →  Add translate function
+Week 3: User wants images   →  Add image generation
+Week 4: User wants...       →  ...you get the idea
 ```
 
-**The agent doesn't need to know what each plugin does.** It just knows:
+Every change means modifying the agent's core code. After a while, the agent becomes a tangled mess of features.
 
-- "I have a list of plugins"
-- "Each plugin has a name, description, and a `run` method"
-- "When I need something, I ask the LLM which plugin to use"
+### The Plugin Solution
 
-This is the **plugin architecture** — one of the most important patterns in software engineering.
+A **plugin system** lets you add features **without touching the core code**:
 
-### The Plugin Contract
-
-Every plugin follows a **contract** (interface). Think of it like a power outlet:
-
-- Every outlet has the same shape (interface)
-- Any device with that plug shape can connect
-- The device can do anything — toast bread, charge a phone, light a lamp
-
-In code, the contract is:
-
-```python
-class BasePlugin:
-    name: str           # "weather"
-    description: str    # "Get current weather for any city"
-    
-    def run(self, **kwargs) -> str:
-        # Do the thing
-        pass
+```
+┌────────────────────────────────────────┐
+│         Agent Core                     │
+│  • Think → Act → Observe loop         │
+│  • Tool dispatch                       │
+│  • Context management                  │
+└──────────────────┬─────────────────────┘
+                   │ "I need a tool"
+                   ▼
+┌────────────────────────────────────────┐
+│         MCPToolRegistry                │
+│  Merges tools from all sources         │
+└──┬──────┬──────┬──────┬────────────────┘
+   │      │      │      │
+   ▼      ▼      ▼      ▼
+ Built  MCP    MCP    MCP
+-in     Srv A  Srv B  Srv C
+Tools  (weth) (trans)(image)
 ```
 
-If your code follows this contract, it's a plugin. Simple.
+Each MCP server is **independent**. It advertises its own tools. The agent discovers them at runtime. No core code changes needed.
+
+### MCP: A Protocol, Not a Framework
+
+The Model Context Protocol (MCP) is an open standard for how agents discover and call external tools. Instead of writing a Python plugin class, your tools run on an MCP server. The server tells the agent:
+
+- "Here are my tools"
+- "Here's what each tool does"
+- "Here's what parameters each tool needs"
+
+The agent connects to the server, gets the tool list, and adds them to its available tools. The agent doesn't need to know if the tool is local, remote, or running in a different language.
 
 ---
 
-## 🔧 Hands-On: Build a Plugin System
+## 🔧 Hands-On: Build an MCP Plugin System
 
-### Step 1: The Plugin Base Class
+### Step 1: The MCPServer — A Tool Advertiser
 
-This is the **contract** that every plugin must follow.
+An MCP server is something that hosts tools and advertises them. Let's build our version:
 
 ```python
-import json
-import os
-from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional
+# mcp_plugin_system.py
 
-# ─── PLUGIN BASE CLASS ────────────────────────────────
+from tool_system import Schema, Tool, ToolDef, build_tool, ToolRegistry
+from typing import Dict, List, Optional, Callable
 
-class BasePlugin(ABC):
+
+class MCPServer:
     """
-    Abstract base class for all plugins.
+    An MCP server that hosts and advertises tools.
     
-    Every plugin must implement:
-    - name: A unique identifier string
-    - description: What this plugin does (for the LLM to decide when to use it)
-    - run(): The main execution method
+    In the real claude-code, MCP servers are processes that
+    communicate over stdio or HTTP. Here we simulate the
+    same pattern — each server holds tools and advertises
+    them via get_tool_schemas().
     
-    Optionally implement:
-    - get_schema(): Returns the JSON schema for LLM function calling
-    - get_config(): Returns configuration options for this plugin
+    Like claude-code's MCP integration
+    (source: restored-src/src/services/tools/toolOrchestration.ts).
     """
+    def __init__(self, name: str, description: str = ""):
+        self.name = name
+        self.description = description
+        self._tools: Dict[str, dict] = {}  # name → schema
 
-    @property
-    @abstractmethod
-    def name(self) -> str:
-        """Unique plugin name (e.g., 'weather', 'translate')."""
-        pass
-
-    @property
-    @abstractmethod
-    def description(self) -> str:
-        """Human-readable description for LLM to understand when to use this."""
-        pass
-
-    @abstractmethod
-    def run(self, **kwargs) -> str:
-        """Execute the plugin with given arguments. Return text result."""
-        pass
-
-    def get_parameters(self) -> dict:
-        """
-        Return the JSON schema for this plugin's parameters.
-        Used for LLM function calling.
-        Default returns empty params — override in your plugin.
-        """
-        return {
-            "type": "object",
-            "properties": {},
-            "required": [],
-        }
-
-    def get_schema(self) -> dict:
-        """Return the full function-calling schema for this plugin."""
-        return {
+    def add_tool(self, name: str, description: str,
+                 input_schema: Schema, call_fn: Callable) -> None:
+        """Register a tool on this MCP server."""
+        schema = {
             "type": "function",
             "function": {
-                "name": self.name,
-                "description": self.description,
-                "parameters": self.get_parameters(),
+                "name": name,
+                "description": description,
+                "parameters": input_schema.to_json_schema(),
             },
         }
-
-    def get_config(self) -> dict:
-        """Return configuration options for this plugin."""
-        return {}
-
-    def __repr__(self) -> str:
-        return f"<Plugin: {self.name}>"
-```
-
-### Step 2: Example Plugin — Weather
-
-The weather plugin gets current weather for a city. In our demo, it simulates weather data (in production, you'd call a real weather API).
-
-```python
-# ─── WEATHER PLUGIN ───────────────────────────────────
-
-import random
-from datetime import datetime
-
-class WeatherPlugin(BasePlugin):
-    """Get the current weather for any city."""
-
-    @property
-    def name(self) -> str:
-        return "get_weather"
-
-    @property
-    def description(self) -> str:
-        return "Get the current weather and forecast for a city. Use when the user asks about weather, temperature, or conditions."
-
-    def get_parameters(self) -> dict:
-        return {
-            "type": "object",
-            "properties": {
-                "city": {
-                    "type": "string",
-                    "description": "The city name, e.g. 'Tokyo', 'London', 'New York'",
-                },
-                "country": {
-                    "type": "string",
-                    "description": "Optional country code for disambiguation, e.g. 'US', 'JP', 'UK'",
-                },
-            },
-            "required": ["city"],
+        self._tools[name] = {
+            "schema": schema,
+            "call": call_fn,
         }
 
-    def run(self, **kwargs) -> str:
-        city = kwargs.get("city", "Unknown")
-        country = kwargs.get("country", "")
-
-        # In production, you'd call: requests.get(f"https://api.weather.com/...")
-        # For this demo, we simulate realistic-looking weather data
-        conditions = ["☀️ Sunny", "⛅ Partly Cloudy", "☁️ Cloudy", "🌧️ Rainy", "⛈️ Thunderstorm", "🌨️ Snowy", "🌫️ Foggy"]
-        condition = random.choice(conditions)
-        temp_c = round(random.uniform(-5, 38), 1)
-        humidity = random.randint(30, 95)
-        wind_speed = round(random.uniform(0, 30), 1)
-
-        location = f"{city}, {country}" if country else city
-        return f"""📍 Weather for {location} at {datetime.now().strftime('%Y-%m-%d %H:%M')}
-┌─────────────────────────────────────────┐
-│ Condition:  {condition}                   
-│ Temp:       {temp_c}°C ({round(temp_c * 9/5 + 32, 1)}°F)      
-│ Humidity:   {humidity}%                       
-│ Wind:       {wind_speed} km/h                    
-└─────────────────────────────────────────┘"""
-
-
-# ─── TRANSLATOR PLUGIN ────────────────────────────────
-
-class TranslatorPlugin(BasePlugin):
-    """Translate text between languages."""
-
-    @property
-    def name(self) -> str:
-        return "translate_text"
-
-    @property
-    def description(self) -> str:
-        return "Translate text from one language to another. Supports 50+ languages."
-
-    def get_parameters(self) -> dict:
-        return {
-            "type": "object",
-            "properties": {
-                "text": {
-                    "type": "string",
-                    "description": "The text to translate",
-                },
-                "target_language": {
-                    "type": "string",
-                    "description": "The target language, e.g. 'Spanish', 'French', 'Japanese'",
-                },
-                "source_language": {
-                    "type": "string",
-                    "description": "Optional source language (auto-detected if not provided)",
-                },
-            },
-            "required": ["text", "target_language"],
-        }
-
-    def run(self, **kwargs) -> str:
-        text = kwargs.get("text", "")
-        target = kwargs.get("target_language", "English")
-        source = kwargs.get("source_language", "auto-detected")
-
-        # In production, you'd call Google Translate API or similar.
-        # For this demo, we simulate translation.
-        translations = {
-            "spanish": f"[Traducción simulada]: {text}",
-            "french": f"[Traduction simulée]: {text}",
-            "japanese": f"[疑似翻訳]: {text}",
-            "german": f"[Simulierte Übersetzung]: {text}",
-            "chinese": f"[模拟翻译]: {text}",
-        }
-
-        lang_key = target.lower()
-        translated = translations.get(lang_key, f"[Simulated translation to {target}]: {text}")
-
-        return f"""🌐 Translation ({source} → {target})
-──────────────────────────────────────
-Original: {text}
-──────────────────────────────────────
-Translated: {translated}
-──────────────────────────────────────"""
-
-
-# ─── IMAGE GENERATION PLUGIN ──────────────────────────
-
-class ImageGenPlugin(BasePlugin):
-    """Generate images from text descriptions."""
-
-    @property
-    def name(self) -> str:
-        return "generate_image"
-
-    @property
-    def description(self) -> str:
-        return "Generate an image from a text description (prompt). Use when the user wants to create, draw, or visualize something."
-
-    def get_parameters(self) -> dict:
-        return {
-            "type": "object",
-            "properties": {
-                "prompt": {
-                    "type": "string",
-                    "description": "Detailed description of the image to generate",
-                },
-                "style": {
-                    "type": "string",
-                    "description": "Art style: 'realistic', 'cartoon', 'watercolor', '3d_render', 'pixel_art'",
-                    "enum": ["realistic", "cartoon", "watercolor", "3d_render", "pixel_art"],
-                },
-                "size": {
-                    "type": "string",
-                    "description": "Image size",
-                    "enum": ["1024x1024", "1024x1792", "1792x1024"],
-                    "default": "1024x1024",
-                },
-            },
-            "required": ["prompt"],
-        }
-
-    def run(self, **kwargs) -> str:
-        prompt = kwargs.get("prompt", "")
-        style = kwargs.get("style", "realistic")
-        size = kwargs.get("size", "1024x1024")
-
-        # In production, you'd call DALL-E or Stable Diffusion:
-        # response = openai.images.generate(model="dall-e-3", prompt=prompt, size=size)
-        # return response.data[0].url
-
-        # For this demo, return a placeholder
-        return f"""🖼️ Image generated!
-──────────────────────────────────────
-Prompt: {prompt}
-Style:  {style}
-Size:   {size}
-──────────────────────────────────────
-[In production, this would call DALL-E 3 or Stable Diffusion API.
- Your image would be returned as a URL or base64 data.]
-──────────────────────────────────────"""
-```
-
-### Step 3: The Plugin Manager
-
-The plugin manager discovers, registers, and provides plugins to the agent.
-
-```python
-# ─── PLUGIN MANAGER ───────────────────────────────────
-
-class PluginManager:
-    """
-    Manages plugin registration, discovery, and execution.
-    
-    Features:
-    - Register plugins manually or auto-discover from a directory
-    - Generate tool schemas for LLM function calling
-    - Execute a plugin by name
-    - List all available plugins
-    """
-
-    def __init__(self, plugin_dir: Optional[str] = None):
-        self._plugins: Dict[str, BasePlugin] = {}
-        self.plugin_dir = plugin_dir
-
-        # If a plugin directory is given, auto-discover
-        if plugin_dir and os.path.isdir(plugin_dir):
-            self.discover_plugins(plugin_dir)
-
-    # ─── Registration ─────────────────────────────────
-
-    def register(self, plugin: BasePlugin):
-        """Register a single plugin by instance."""
-        if plugin.name in self._plugins:
-            print(f"⚠️ Warning: Overwriting plugin '{plugin.name}'")
-        self._plugins[plugin.name] = plugin
-        print(f"✅ Registered plugin: {plugin.name}")
-
-    def register_many(self, *plugins: BasePlugin):
-        """Register multiple plugins at once."""
-        for plugin in plugins:
-            self.register(plugin)
-
-    def unregister(self, plugin_name: str):
-        """Remove a plugin by name."""
-        if plugin_name in self._plugins:
-            del self._plugins[plugin_name]
-            print(f"🗑️ Unregistered plugin: {plugin_name}")
-        else:
-            print(f"⚠️ Plugin '{plugin_name}' not found")
-
-    # ─── Discovery ────────────────────────────────────
-
-    def discover_plugins(self, directory: str):
+    def discover(self) -> List[dict]:
         """
-        Auto-discover plugins from a directory.
-        Scans for Python files and looks for BasePlugin subclasses.
-        """
-        import importlib.util
-        import inspect
-
-        print(f"🔍 Discovering plugins in: {directory}")
-        found = 0
-
-        for filename in os.listdir(directory):
-            if not filename.endswith(".py") or filename.startswith("_"):
-                continue
-
-            filepath = os.path.join(directory, filename)
-            module_name = filename[:-3]
-
-            try:
-                # Load the module dynamically
-                spec = importlib.util.spec_from_file_location(module_name, filepath)
-                if spec and spec.loader:
-                    module = importlib.util.module_from_spec(spec)
-                    spec.loader.exec_module(module)
-
-                    # Find all BasePlugin subclasses in the module
-                    for name, obj in inspect.getmembers(module):
-                        if (inspect.isclass(obj) 
-                            and issubclass(obj, BasePlugin) 
-                            and obj is not BasePlugin):
-                            instance = obj()
-                            self.register(instance)
-                            found += 1
-
-            except Exception as e:
-                print(f"❌ Failed to load plugin from {filename}: {e}")
-
-        if found == 0:
-            print("   No plugins found in directory.")
-        else:
-            print(f"   Discovered {found} plugin(s).")
-
-    # ─── Access ───────────────────────────────────────
-
-    def get_plugin(self, name: str) -> Optional[BasePlugin]:
-        """Get a plugin by name."""
-        return self._plugins.get(name)
-
-    def list_plugins(self) -> list:
-        """List all registered plugins with their details."""
-        return [
-            {
-                "name": p.name,
-                "description": p.description,
-                "config": p.get_config(),
-            }
-            for p in self._plugins.values()
-        ]
-
-    def get_all_schemas(self) -> list:
-        """Get function-calling schemas for all plugins (for LLM tool use)."""
-        return [p.get_schema() for p in self._plugins.values()]
-
-    # ─── Execution ────────────────────────────────────
-
-    def execute(self, plugin_name: str, **kwargs) -> str:
-        """Execute a plugin by name with given arguments."""
-        plugin = self.get_plugin(plugin_name)
-        if not plugin:
-            return f"Error: Plugin '{plugin_name}' not found. Available: {list(self._plugins.keys())}"
+        Advertise all tools on this server.
         
+        The agent calls this at connection time to learn
+        what tools are available. This is the MCP equivalent
+        of the "initialize" handshake.
+        """
+        print(f"  🔍 Discovering tools from MCP server '{self.name}'...")
+        return [info["schema"] for info in self._tools.values()]
+
+    def execute(self, tool_name: str, args: dict) -> str:
+        """Execute a tool on this server."""
+        if tool_name not in self._tools:
+            return f"Error: MCP server '{self.name}' has no tool '{tool_name}'"
+
         try:
-            return plugin.run(**kwargs)
+            return self._tools[tool_name]["call"](**args)
         except Exception as e:
-            return f"Error executing plugin '{plugin_name}': {e}"
+            return f"Error from MCP server '{self.name}': {type(e).__name__}: {e}"
 
-    def __len__(self) -> int:
-        return len(self._plugins)
-
-    def __contains__(self, name: str) -> bool:
-        return name in self._plugins
+    def has_tool(self, name: str) -> bool:
+        return name in self._tools
 ```
 
-### Step 4: Plugin-Aware Agent
+### Step 2: The MCPToolRegistry — Merging All Tools
 
-Now we build an agent that uses the plugin manager. The agent doesn't know what plugins exist — it just asks the plugin manager for available tools and executes them by name.
+Now we need a registry that merges built-in tools with tools from MCP servers. This is how claude-code's `toolOrchestration.ts` works — every tool is just a tool, regardless of where it comes from:
 
 ```python
-# ─── PLUGIN-AWARE AGENT ──────────────────────────────
+class MCPToolRegistry:
+    """
+    Aggregates tools from built-in definitions and MCP servers.
+    
+    The agent sees one unified list of tools. It doesn't know
+    (or care) which server provides each tool. When a tool
+    is called, the registry routes to the right provider.
+    
+    Like claude-code's orchestration layer
+    (source: restored-src/src/services/tools/toolOrchestration.ts).
+    """
+    def __init__(self, built_in_registry: ToolRegistry):
+        self.built_in = built_in_registry
+        self.mcp_servers: Dict[str, MCPServer] = {}
 
-import openai
-
-class PluginAgent:
-    """An agent that can use any registered plugin."""
-
-    def __init__(self, plugin_manager: PluginManager, model: str = "gpt-4o-mini"):
-        self.plugins = plugin_manager
-        self.model = model
-        self.memory = []
-
-    def run(self, user_input: str, max_steps: int = 5) -> str:
-        """Run the agent with plugin support."""
-        system_prompt = """You are an AI assistant with access to plugins.
-Each plugin gives you a superpower. When the user asks for something:
-1. Check if you have a relevant plugin
-2. If yes, use it by calling the function
-3. If no, answer using your own knowledge
-
-Always use the plugin when it's relevant — that's why it exists!"""
-
-        schemas = self.plugins.get_all_schemas()
+    def attach_server(self, server: MCPServer) -> None:
+        """
+        Connect an MCP server and discover its tools.
         
-        messages = [{"role": "system", "content": system_prompt}]
-        messages.extend(self.memory[-6:])  # Keep recent context
-        messages.append({"role": "user", "content": user_input})
+        This is called at startup for each configured server.
+        After this, the server's tools are available alongside
+        built-in tools.
+        """
+        print(f"📡 Attaching MCP server: {server.name}")
+        schemas = server.discover()
+        print(f"   Found {len(schemas)} tool(s)")
+        self.mcp_servers[server.name] = server
 
-        step = 0
-        while step < max_steps:
-            response = openai.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                tools=schemas if schemas else None,
-                temperature=0.3,
-            )
+    def get_all_tool_schemas(self) -> List[dict]:
+        """
+        Get schemas for ALL tools: built-in + MCP.
+        This is what gets sent to the LLM.
+        """
+        schemas = self.built_in.get_openai_schemas()
+        for server in self.mcp_servers.values():
+            schemas.extend(server.discover())
+        return schemas
 
-            msg = response.choices[0].message
+    def execute(self, tool_name: str, args: dict) -> str:
+        """
+        Execute a tool, routing to the right provider.
+        
+        1. Check built-in tools first
+        2. Check each MCP server
+        3. Unknown tool → error
+        """
+        # Try built-in
+        tool = self.built_in.find_tool(tool_name)
+        if tool:
+            return tool.call(**args)
 
-            if not msg.tool_calls:
-                final = msg.content
-                self.memory.append({"role": "user", "content": user_input})
-                self.memory.append({"role": "assistant", "content": final})
-                return final
+        # Try MCP servers
+        for server in self.mcp_servers.values():
+            if server.has_tool(tool_name):
+                return server.execute(tool_name, args)
 
-            messages.append(msg)
-            for tc in msg.tool_calls:
-                tool_name = tc.function.name
-                try:
-                    args = json.loads(tc.function.arguments)
-                except json.JSONDecodeError:
-                    args = {}
+        return f"Error: Unknown tool '{tool_name}'."
+```
 
-                print(f"🔧 Using plugin: {tool_name}({args})")
-                result = self.plugins.execute(tool_name, **args)
-                print(f"   Result: {result[:100]}...")
+### Step 3: Build MCP Servers (Plugins)
 
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": str(result),
-                })
+Now let's create some MCP servers. Each one is independent and advertises its own tools:
 
-            step += 1
+```python
+# ─── Weather MCP Server ─────────────────────────────
 
-        return "Agent reached maximum steps without completing."
+import math
+import json
+import os
+
+weather_server = MCPServer(
+    name="weather",
+    description="Weather data provider",
+)
+
+weather_schema = Schema(
+    properties={
+        "city": {"type": "string", "description": "City name, e.g. 'Tokyo'"},
+    },
+    required=["city"],
+)
+
+def weather_impl(city: str) -> str:
+    """Get weather for a city using wttr.in."""
+    import urllib.request
+    url = f"https://wttr.in/{city}?format=3"
+    try:
+        with urllib.request.urlopen(url, timeout=5) as response:
+            return response.read().decode("utf-8").strip()
+    except Exception as e:
+        # Fallback to simulated data
+        fake_data = {
+            "tokyo": "22°C, sunny",
+            "london": "15°C, cloudy",
+            "new york": "18°C, light rain",
+            "paris": "20°C, partly cloudy",
+        }
+        return fake_data.get(city.lower(), f"20°C, clear (simulated for {city})")
+
+weather_server.add_tool(
+    name="get_weather",
+    description="Get the current weather for a city. Uses real data from wttr.in.",
+    input_schema=weather_schema,
+    call_fn=weather_impl,
+)
 
 
-# ─── DEMO ─────────────────────────────────────────────
+# ─── Translator MCP Server ──────────────────────────
 
-if __name__ == "__main__":
-    print("🧩 Plugin System Demo")
-    print("=" * 50)
+translator_server = MCPServer(
+    name="translator",
+    description="Simple text translation",
+)
 
-    # Create plugin manager and register plugins
-    manager = PluginManager()
-    manager.register_many(
-        WeatherPlugin(),
-        TranslatorPlugin(),
-        ImageGenPlugin(),
-    )
+translate_schema = Schema(
+    properties={
+        "text": {"type": "string", "description": "Text to translate"},
+        "target_language": {
+            "type": "string",
+            "description": "Target language, e.g. 'spanish', 'french', 'japanese'",
+        },
+    },
+    required=["text", "target_language"],
+)
 
-    print(f"\n📋 Registered plugins: {len(manager)}")
-    for p in manager.list_plugins():
-        print(f"  • {p['name']}: {p['description'][:60]}...")
+def translate_impl(text: str, target_language: str) -> str:
+    """Simulated translation."""
+    fake_translations = {
+        "hello": {
+            "spanish": "hola",
+            "french": "bonjour",
+            "japanese": "こんにちは",
+            "german": "hallo",
+        },
+        "goodbye": {
+            "spanish": "adiós",
+            "french": "au revoir",
+            "japanese": "さようなら",
+        },
+    }
+    text_lower = text.lower().strip()
+    if text_lower in fake_translations:
+        translation = fake_translations[text_lower].get(target_language.lower())
+        if translation:
+            return translation
+    return f"[{target_language}] {text} (translated)"
 
-    # Create the agent
-    agent = PluginAgent(manager)
+translator_server.add_tool(
+    name="translate",
+    description="Translate text to another language.",
+    input_schema=translate_schema,
+    call_fn=translate_impl,
+)
 
-    # Test queries
-    test_queries = [
-        "What's the weather like in Tokyo?",
-        "Translate 'Good morning' to Spanish",
-        "Generate an image of a cat wearing a hat",
+
+# ─── Math Extension MCP Server ──────────────────────
+
+math_ext_server = MCPServer(
+    name="math_extensions",
+    description="Advanced math operations",
+)
+
+fib_schema = Schema(
+    properties={
+        "n": {"type": "integer", "description": "Position in Fibonacci sequence (1-based)"},
+    },
+    required=["n"],
+)
+
+def fibonacci_impl(n: int) -> str:
+    """Calculate the nth Fibonacci number."""
+    if n < 1:
+        return "Error: n must be >= 1"
+    if n > 100:
+        return "Error: n must be <= 100"
+
+    a, b = 0, 1
+    for _ in range(n):
+        a, b = b, a + b
+    return str(a)
+
+math_ext_server.add_tool(
+    name="fibonacci",
+    description="Calculate the nth Fibonacci number.",
+    input_schema=fib_schema,
+    call_fn=fibonacci_impl,
+)
+```
+
+### Step 4: Connect Everything
+
+Now let's put it all together — built-in tools plus MCP servers:
+
+```python
+# ─── Built-in tools (same as previous chapters) ──────
+
+calc_schema = Schema(
+    properties={
+        "expression": {"type": "string", "description": "Math expression"},
+    },
+    required=["expression"],
+)
+
+def calc_impl(expression: str) -> str:
+    allowed = {"sqrt": math.sqrt, "pi": math.pi, "abs": abs}
+    return str(eval(expression, {"__builtins__": {}}, allowed))
+
+calculator = build_tool(ToolDef(
+    name="calculate",
+    description="Evaluate a mathematical expression",
+    input_schema=calc_schema,
+    call=calc_impl,
+    is_concurrency_safe=True,
+))
+
+built_in_registry = ToolRegistry()
+built_in_registry.register(calculator)
+
+# ─── MCP Tool Registry ──────────────────────────────
+
+mcp_registry = MCPToolRegistry(built_in_registry)
+
+# Attach MCP servers (plugins)
+mcp_registry.attach_server(weather_server)
+mcp_registry.attach_server(translator_server)
+mcp_registry.attach_server(math_ext_server)
+
+# Get the full list of tools for the LLM
+all_tool_schemas = mcp_registry.get_all_tool_schemas()
+
+print(f"\n📦 {len(all_tool_schemas)} tools available:")
+for s in all_tool_schemas:
+    print(f"  • {s['function']['name']}: {s['function']['description'][:60]}")
+```
+
+### Step 5: The Plugin-Aware Agent Loop
+
+```python
+# ─── Agent with plugin support ──────────────────────
+
+from openai import OpenAI
+
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+def run_agent(user_input: str, max_steps: int = 10) -> str:
+    messages = [
+        {"role": "system", "content": (
+            "You are a helpful agent with access to tools from multiple sources. "
+            "You have built-in tools (calculate) and tools from MCP servers "
+            "(weather, translate, fibonacci). Use whichever tool is appropriate "
+            "for the task."
+        )},
+        {"role": "user", "content": user_input},
     ]
 
-    for query in test_queries:
-        print(f"\n{'─' * 50}")
-        print(f"👤 User: {query}")
-        print(f"{'─' * 50}")
-        response = agent.run(query)
-        print(f"🤖 Agent: {response}")
-```
+    step = 0
+    while step < max_steps:
+        step += 1
+        print(f"\n🔄 Step {step}")
 
-### Step 5: Auto-Discovery from Disk
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            tools=all_tool_schemas,
+        )
 
-In a real project, you'd want plugins to live in separate files and be auto-discovered. Here's the folder structure:
+        msg = response.choices[0].message
 
-```
-project/
-├── agent.py              # Main agent
-├── plugins/
-│   ├── __init__.py
-│   ├── weather.py        # WeatherPlugin
-│   ├── translator.py     # TranslatorPlugin
-│   └── image_gen.py      # ImageGenPlugin
-└── plugin_manager.py     # PluginManager
-```
+        if not msg.tool_calls:
+            return msg.content
 
-Let's create a standalone plugin file to demonstrate auto-discovery:
+        messages.append(msg)
+        for tc in msg.tool_calls:
+            tool_name = tc.function.name
+            args = json.loads(tc.function.arguments)
+            print(f"  🔧 {tool_name}({args})")
 
-```python
-# ─── plugins/hello.py (example plugin file for auto-discovery) ───
+            # Execute via MCP registry (routes to built-in or server)
+            result = mcp_registry.execute(tool_name, args)
+            print(f"  ✅ {result[:80]}")
 
-"""
-A simple demo plugin saved to disk.
-Place this in a 'plugins/' folder and the PluginManager
-will discover it automatically.
-"""
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": result,
+            })
 
-from plugin_system import BasePlugin  # Would import from your module
+    return "Max steps reached."
 
-class HelloPlugin(BasePlugin):
-    """A simple greeting plugin for demo purposes."""
 
-    @property
-    def name(self) -> str:
-        return "say_hello"
+# ─── Try it ──────────────────────────────────────────
 
-    @property
-    def description(self) -> str:
-        return "Say hello to someone in a friendly way."
+if __name__ == "__main__":
+    print("\n=== Testing MCP Plugin System ===\n")
 
-    def get_parameters(self) -> dict:
-        return {
-            "type": "object",
-            "properties": {
-                "name": {
-                    "type": "string",
-                    "description": "The name of the person to greet",
-                },
-                "language": {
-                    "type": "string",
-                    "description": "Language to greet in",
-                    "enum": ["english", "spanish", "french", "japanese"],
-                },
-            },
-            "required": ["name"],
-        }
+    tests = [
+        "What's the weather in Tokyo?",           # From weather MCP server
+        "Translate 'hello' to Spanish",           # From translator MCP server
+        "Calculate the 10th Fibonacci number",    # From math_ext MCP server
+        "What is 42 * 15?",                       # Built-in calculator
+        "Weather in Paris and translate 'goodbye' to French",  # Mixed sources
+    ]
 
-    def run(self, **kwargs) -> str:
-        name = kwargs.get("name", "World")
-        language = kwargs.get("language", "english")
-        
-        greetings = {
-            "english": f"Hello, {name}! Nice to meet you!",
-            "spanish": f"¡Hola, {name}! ¡Mucho gusto!",
-            "french": f"Bonjour, {name}! Enchanté!",
-            "japanese": f"こんにちは、{name}さん！はじめまして！",
-        }
-        
-        return greetings.get(language, f"Hello, {name}!")
+    for test in tests:
+        print(f"\n{'#'*60}")
+        print(f"❓ {test}")
+        print(f"{'#'*60}")
+        result = run_agent(test)
+        print(f"\n📨 {result}")
 ```
 
 ---
 
 ## 🔍 How It Works
 
-### Plugin Architecture
+### MCP: Dynamic Tool Discovery
 
-```
-┌──────────────────────────────────────────────────┐
-│                  Agent Core                       │
-│  Knows: "I have plugins"                         │
-│  Knows: "Each plugin has run()"                  │
-│  Does NOT know plugin internals                  │
-└──────────────────┬───────────────────────────────┘
-                   │  "What tools do I have?"
-                   ▼
-┌──────────────────────────────────────────────────┐
-│               Plugin Manager                      │
-│  - Holds all plugins in a dict                    │
-│  - Generates schemas for LLM                      │
-│  - Routes execution to the right plugin           │
-│  - Handles discovery and registration             │
-└──┬───────────┬───────────┬───────────────────────┘
-   │           │           │
-   ▼           ▼           ▼
-┌──────┐ ┌──────────┐ ┌──────────┐
-│Weather│ │Translate │ │Image Gen │
-│Plugin │ │Plugin    │ │Plugin    │
-└──────┘ └──────────┘ └──────────┘
-```
+The key difference between plugins and MCP:
 
-### Why This Pattern Matters
-
-**Without plugins**, adding "translate to Spanish" means:
-1. Open the agent's main code
-2. Add a `translate_to_spanish()` function
-3. Add it to the tool list
-4. Test the entire agent
-5. Redeploy
-6. Hope you didn't break anything
-
-**With plugins**, adding "translate to Spanish" means:
-1. Create `translator.py` with the `TranslatorPlugin` class
-2. Drop it in the `plugins/` folder
-3. Done. The plugin manager discovers it automatically.
-
-### Plugin vs Hard-Coded Tool
-
-| Feature | Hard-Coded Tool | Plugin |
+| Approach | How Tools Are Known | When It Happens |
 |---|---|---|
-| Adding new capability | Edit core agent code | Create a new file |
-| Removing a capability | Edit core agent code | Delete the file |
-| Third-party contributions | Not possible | Just create a plugin |
-| Testing | Test entire agent | Test plugin in isolation |
-| Configuration | Environment variables | Plugin-level config |
-| Reusability | Specific to one agent | Drop into any agent |
+| **Hard-coded** | We import and register them | At code startup |
+| **Plugin folder** | We scan a directory for .py files | At code startup |
+| **MCP** (this chapter) | Each server advertises its tools | At connection time |
 
-### The Function Calling Schema
+With MCP, the agent doesn't need to know what tools exist. It connects to a server and the server says "here's what I can do." This means:
 
-Each plugin exposes a JSON schema that tells the LLM:
+- **Add a new tool**: Just start a new MCP server
+- **Update a tool**: Restart the MCP server (agent picks up changes on reconnect)
+- **Remove a tool**: Stop the MCP server
+- **Language-agnostic**: The MCP server can be written in any language
 
-1. **What** the plugin does (description)
-2. **What arguments** it needs (parameters)
-3. **What values** are valid (enums, types)
+### How Tool Resolution Works
 
-The LLM reads these schemas and decides: "The user wants weather — I have a `get_weather` plugin with a `city` parameter. Let me call it."
+When the agent calls `mcp_registry.execute("get_weather", {"city": "Tokyo"})`:
 
-This is pure discovery. The agent doesn't need to know about weather at the code level — it just reads the schema and figures it out.
+```
+1. Check built-in registry → "get_weather" not found
+2. Check "weather" MCP server → found! Execute there
+3. Return result
+```
+
+When the agent calls `mcp_registry.execute("calculate", {"expression": "2 + 2"})`:
+
+```
+1. Check built-in registry → "calculate" found! Execute
+2. Return result
+```
+
+The LLM never knows which server provided the tool. It just sees "there's a tool called get_weather" and uses it.
+
+### Attaching vs. Importing
+
+In a plugin system, you `import` the plugin. In MCP, you **attach** the server:
+
+| Import | Attach |
+|---|---|
+| `from weather import get_weather` | `mcp_registry.attach_server(weather_server)` |
+| Must happen at module level | Happens at runtime |
+| Tool is always available | Tool is available once attached |
+| Can't remove without restart | Can detach at any time |
+| Python-only | Language-agnostic |
+
+### Real MCP vs. Our Simplified Version
+
+In the real claude-code, MCP servers are separate processes or HTTP endpoints:
+
+```
+Our version:
+MCPServer(name="weather", ...)  →  Same Python process
+
+Real MCP:
+weather_server = Process("python weather_mcp.py")
+# or
+weather_server = HTTPEndpoint("http://localhost:8080/mcp")
+```
+
+The real MCP uses stdin/stdout or HTTP for communication. Our `MCPServer` class simulates this — the `execute()` method calls the function directly instead of making a network request. But the architecture is the same: discover tools at connection, route calls to the right server.
 
 ---
 
 ## 🧪 Exercises
 
-### Exercise 1: Build a Calculator Plugin
+### Exercise 1: Create a Database Query MCP Server
 
-Create a `CalculatorPlugin` that evaluates math expressions. It should accept an `expression` string and return the result. Use Python's `eval()` (with safety restrictions) or the `numexpr` library.
-
-```python
-class CalculatorPlugin(BasePlugin):
-    @property
-    def name(self) -> str:
-        return "calculate"
-    
-    # ... implement the rest
-```
-
-### Exercise 2: Plugin Configuration
-
-Add a `configure()` method to your plugins. For example, the WeatherPlugin could accept an `api_key` parameter, and the ImageGenPlugin could accept a `default_size`. Store these in a `config.json` file that the plugin manager loads.
+Build an MCP server that simulates a database:
 
 ```python
-# Example config.json
-{
-    "weather": {"api_key": "abc123", "units": "metric"},
-    "image_gen": {"default_size": "1024x1024", "model": "dall-e-3"}
-}
+db_server = MCPServer(name="database", description="Query a product database")
+
+query_schema = Schema(
+    properties={
+        "sql": {"type": "string", "description": "SQL query (simulated)"},
+    },
+    required=["sql"],
+)
+
+def query_db_impl(sql: str) -> str:
+    """Simulated database query."""
+    fake_data = {
+        "products": [
+            {"id": 1, "name": "Laptop", "price": 999},
+            {"id": 2, "name": "Mouse", "price": 25},
+            {"id": 3, "name": "Keyboard", "price": 75},
+        ]
+    }
+    if "product" in sql.lower():
+        return json.dumps(fake_data["products"], indent=2)
+    return f"Query executed: {sql[:50]}... (simulated)"
+
+db_server.add_tool(
+    name="query_database",
+    description="Query the product database.",
+    input_schema=query_schema,
+    call_fn=query_db_impl,
+)
 ```
 
-### Exercise 3: Plugin Dependencies
+### Exercise 2: Tool Namespacing
 
-Some plugins depend on other plugins. Add a `requires` property to `BasePlugin` that lists required plugins. The plugin manager should check dependencies and warn if any are missing.
+What happens if two MCP servers have a tool with the same name? Modify the registry to handle conflicts:
 
 ```python
-class ReportPlugin(BasePlugin):
-    @property
-    def requires(self) -> list:
-        return ["weather", "calculator"]  # Needs these to work
+def execute(self, tool_name, args):
+    # If multiple servers have the same tool,
+    # use the first one attached
+    if tool_name in self._tool_to_server:
+        server = self._tool_to_server[tool_name]
+        return server.execute(tool_name, args)
+    ...
 ```
 
-### Exercise 4: Plugin Priority
+### Exercise 3: Status Endpoint
 
-Add a `priority` property to plugins. If two plugins can handle the same task, the one with higher priority wins. For example, a `PremiumTranslatorPlugin` might have priority 10, while a `BasicTranslatorPlugin` has priority 1.
-
-### Exercise 5: Plugin Hot-Reload
-
-Implement a `watch` mode for the plugin manager. Use `watchdog` (a Python library) to monitor the plugins folder for file changes. When a file is added, removed, or modified, reload the affected plugins without restarting the agent.
-
-### Challenge: Build a Plugin Marketplace
-
-Create a simple system where plugins can be downloaded and installed from a URL:
+Add a health check to each MCP server:
 
 ```python
-manager.install_from_url("https://plugins.example.com/weather.py")
+class MCPHealthServer(MCPServer):
+    def status(self) -> dict:
+        return {
+            "name": self.name,
+            "tools": len(self._tools),
+            "healthy": all(self._tools.keys()),
+        }
 ```
 
-The manager should:
-- Download the file
-- Save it to the plugins directory
-- Validate it's a proper plugin (is it a BasePlugin subclass?)
-- Register it
-- Handle errors gracefully
+### Exercise 4: Detach a Server
+
+Add a `detach_server` method to remove a server's tools at runtime:
+
+```python
+def detach_server(self, name: str) -> None:
+    if name in self.mcp_servers:
+        del self.mcp_servers[name]
+        print(f"📡 Detached MCP server: {name}")
+```
+
+### Challenge: MCP Server as an External Process
+
+Create an MCP server that runs as a separate Python process and communicates via JSON over stdin/stdout:
+
+```python
+import sys
+import json
+
+# weather_mcp_server.py
+def handle_request(request: dict) -> dict:
+    tool = request.get("tool")
+    args = request.get("args", {})
+
+    if tool == "get_weather":
+        city = args.get("city", "")
+        return {"result": f"22°C, sunny in {city}"}
+    return {"error": f"Unknown tool: {tool}"}
+
+if __name__ == "__main__":
+    for line in sys.stdin:
+        request = json.loads(line)
+        response = handle_request(request)
+        print(json.dumps(response))
+        sys.stdout.flush()
+```
+
+The agent communicates with this server by writing JSON to stdin and reading from stdout — exactly how real MCP servers work.
 
 ---
 
@@ -782,185 +643,66 @@ The manager should:
 
 ### Key Concepts
 
-| Concept | What It Means |
-|---|---|
-| **Plugin** | A self-contained module that adds a capability to the agent |
-| **Plugin Interface** | The contract (BasePlugin) every plugin must follow |
-| **Plugin Manager** | The system that registers, discovers, and executes plugins |
-| **Schema** | JSON description of a plugin's parameters, used by the LLM |
-| **Discovery** | Finding and loading plugins automatically from a directory |
-| **Registration** | Adding a plugin to the manager so it's available to the agent |
-| **Auto-Discovery** | Scanning a folder for plugin files and loading them automatically |
+| Concept | What It Means | In claude-code |
+|---|---|---|
+| **MCP Server** | Hosts tools and advertises them | `toolOrchestration.ts` |
+| **MCPToolRegistry** | Merges built-in + server tools | `ToolSearchTool` |
+| **Discovery** | Server tells agent what tools it has | `initialize` handshake |
+| **Routing** | Registry finds the right server for each tool | `execute` dispatch |
+| **Attach/Detach** | Add/remove servers at runtime | Dynamic MCP connection |
 
-### The Plugin Pattern
-
-```
-BasePlugin (abstract) → WeatherPlugin, TranslatorPlugin, etc.
-                              ↓
-                        PluginManager
-                              ↓
-                    Agent uses schemas to decide
-                              ↓
-                    LLM says "call get_weather()"
-                              ↓
-                    PluginManager.execute("get_weather", city="Tokyo")
-                              ↓
-                    WeatherPlugin.run(city="Tokyo") → "☀️ 25°C"
-```
-
-### The Key Insight
-
-> **A plugin system separates WHAT the agent can do from HOW it does it. The agent focuses on deciding; plugins focus on executing. This is the foundation of extensible software.**
-
-### Behind the Code: How claude-code Integrates External Tools (MCP)
-
-The real **claude-code** ([sourcemap](https://github.com/ChinaSiro/claude-code-sourcemap)) supports the **Model Context Protocol (MCP)** — an open standard for adding external tools dynamically:
-
-**Source: [`restored-src/src/services/tools/toolOrchestration.ts`](https://github.com/ChinaSiro/claude-code-sourcemap/blob/main/restored-src/src/services/tools/toolOrchestration.ts)**
-
-Instead of a plugin manager that scans a folder, claude-code connects to **MCP servers** that advertise their own tools:
+### The Code You Own
 
 ```python
-# Conceptual model: MCP tool integration in claude-code
-# Source: restored-src/src/services/tools/toolOrchestration.ts
+from tool_system import Schema, Tool, ToolDef, build_tool, ToolRegistry
 
-from typing import Dict, List, Optional
+# ─── MCP Server (hosts tools) ───
 
 class MCPServer:
-    """
-    A remote tool server implementing the Model Context Protocol.
-    
-    MCP servers advertise their capabilities to the agent dynamically.
-    The agent discovers what tools are available at connection time.
-    """
-    def __init__(self, name: str, endpoint: str):
+    def __init__(self, name, description=""):
         self.name = name
-        self.endpoint = endpoint
-        self.tools: Dict[str, dict] = {}
-    
-    def connect(self) -> bool:
-        """
-        Connect to the MCP server and discover its tools.
-        Claude-code calls this at startup for each configured server.
-        """
-        # In reality, this sends an MCP initialize request
-        print(f"🔌 Connecting to MCP server: {self.name} ({self.endpoint})")
-        return True
-    
-    def get_tool_schemas(self) -> List[dict]:
-        """
-        Get all tool schemas advertised by this server.
-        These are merged with built-in tools for the LLM to use.
-        """
-        return list(self.tools.values())
+        self._tools = {}
 
+    def add_tool(self, name, description, input_schema, call_fn):
+        self._tools[name] = {"call": call_fn}
+
+    def discover(self):
+        return [t["schema"] for t in self._tools.values()]
+
+    def execute(self, tool_name, args):
+        if tool_name in self._tools:
+            return self._tools[tool_name]["call"](**args)
+        return f"Unknown tool: {tool_name}"
+
+# ─── MCP Registry (merges all tools) ───
 
 class MCPToolRegistry:
-    """
-    Aggregates tools from multiple MCP servers + built-in tools.
-    
-    Claude-code merges all available tools (built-in + MCP) into
-    a single list that the LLM sees. The LLM doesn't know (or care)
-    which server provides each tool.
-    """
-    def __init__(self):
-        self.built_in_tools: Dict[str, callable] = {}
-        self.mcp_servers: List[MCPServer] = []
-    
-    def add_mcp_server(self, server: MCPServer) -> None:
-        """Register an MCP server. Tools from it become available."""
-        self.mcp_servers.append(server)
-    
-    def get_all_tool_schemas(self) -> List[dict]:
-        """Combine built-in tools + all MCP server tools."""
-        schemas = []
-        # Built-in tools
-        for name, fn in self.built_in_tools.items():
-            schemas.append(self._tool_to_schema(name, fn))
-        # MCP tools
-        for server in self.mcp_servers:
-            schemas.extend(server.get_tool_schemas())
-        return schemas
-    
-    def execute(self, tool_name: str, args: dict) -> str:
-        """Execute a tool, routing to the right provider."""
-        # Check built-in first
-        if tool_name in self.built_in_tools:
-            return self.built_in_tools[tool_name](**args)
-        # Try each MCP server
-        for server in self.mcp_servers:
-            if tool_name in server.tools:
-                # Route to MCP server
-                return self._call_mcp(server, tool_name, args)
-        return f"Error: Unknown tool '{tool_name}'"
-    
-    @staticmethod
-    def _tool_to_schema(name: str, fn: callable) -> dict:
-        """Generate OpenAI-compatible schema from a function."""
-        import inspect
-        sig = inspect.signature(fn)
-        props = {}
-        for param_name, param in sig.parameters.items():
-            props[param_name] = {
-                "type": "string",
-                "description": f"Parameter: {param_name}",
-            }
-        return {
-            "type": "function",
-            "function": {
-                "name": name,
-                "description": fn.__doc__ or "",
-                "parameters": {"type": "object", "properties": props},
-            },
-        }
-    
-    def _call_mcp(self, server: MCPServer, tool: str, args: dict) -> str:
-        """Execute a tool on an MCP server remotely."""
-        # In reality, this sends an MCP tools/call request
-        print(f"📡 Calling MCP tool {server.name}/{tool}")
-        return f"(mocked result from MCP tool '{tool}')"
+    def __init__(self, built_in_registry):
+        self.built_in = built_in_registry
+        self.servers = {}
 
+    def attach_server(self, server):
+        self.servers[server.name] = server
 
-# ─── Usage: Plugins via MCP ───
+    def execute(self, tool_name, args):
+        tool = self.built_in.find_tool(tool_name)
+        if tool:
+            return tool.call(**args)
+        for server in self.servers.values():
+            if server._tools.get(tool_name):
+                return server.execute(tool_name, args)
+        return f"Unknown tool: {tool_name}"
 
-registry = MCPToolRegistry()
+# ─── Usage ───
 
-# Built-in tools
-def search_web(query: str) -> str:
-    return f"Search results for: {query}"
-registry.built_in_tools["search_web"] = search_web
+weather_mcp = MCPServer("weather")
+weather_mcp.add_tool("get_weather", "Get weather", schema, impl)
 
-# Connect MCP servers (external plugins)
-weather_mcp = MCPServer("weather", "http://localhost:8081/mcp")
-weather_mcp.tools = {
-    "get_weather": {
-        "type": "function",
-        "function": {
-            "name": "get_weather",
-            "description": "Get weather for a city",
-            "parameters": {
-                "type": "object",
-                "properties": {"city": {"type": "string"}},
-            },
-        },
-    }
-}
-registry.add_mcp_server(weather_mcp)
+registry = MCPToolRegistry(built_in_registry)
+registry.attach_server(weather_mcp)
 
-# Now the agent has both built-in + MCP tools combined
-all_tools = registry.get_all_tool_schemas()
-for t in all_tools:
-    print(f"📦 Available tool: {t['function']['name']}")
+# Agent calls any tool: built-in or MCP
+result = registry.execute("get_weather", {"city": "Tokyo"})
 ```
 
-The key difference from our plugin system: MCP tools are **remote and dynamically discovered**. The agent connects to servers at runtime, gets their tool list, and can use them immediately without code changes. This is how claude-code supports extensions like database connectors, API integrations, and custom workflows — each MCP server contributes its own tools independently.
-
-For more details, see claude-code's [tool orchestration source](https://github.com/ChinaSiro/claude-code-sourcemap/blob/main/restored-src/src/services/tools/toolOrchestration.ts) and the `ToolSearchTool` for dynamic tool discovery.
-
-### What's Next?
-
-In **[Chapter 12: Security & Permissions](./12-security.md)**, you'll learn how to protect your agent from attacks, limit what tools can do, and build a permission system that keeps your users safe.
-
----
-
-*"Good fences make good neighbors." — Robert Frost*
+> **Next up: Chapter 12 — Evaluation & Testing. How do you know if your agent is actually working?**

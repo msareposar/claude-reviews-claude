@@ -1,6 +1,6 @@
 # 06. Context & Working Memory
 
-> **In this chapter: What is context window? How does your agent remember what just happened? You'll build a context manager that tracks conversation history and trims it intelligently.**
+> **In this chapter: What is context window? How does your agent remember what just happened? You'll build a context manager with auto-compaction and a file-based persistent memory system — inspired by claude-code's memdir.**
 
 ---
 
@@ -9,10 +9,10 @@
 By the end of this chapter, you will:
 
 - Understand what a "context window" is and why it matters
-- Know how conversation history works in LLM APIs
-- Build a sliding window that keeps only recent messages
-- Implement token counting and smart truncation
-- Build a summary-based compression system
+- Build a **ContextManager** with token budget tracking (like claude-code's `compact.ts`)
+- Implement **auto-compaction** that summarizes old messages when nearing the limit
+- Build a **Memdir** — a file-based persistent memory system (like claude-code's `~/.claude/memory/`)
+- Combine short-term and long-term memory in your agent
 
 ---
 
@@ -26,443 +26,657 @@ But if the conversation goes on for hours, they start forgetting the early parts
 
 The **context window** is like your agent's desk. It can only fit so many papers on it at once. When too many papers pile up, it has to put some away (forget them) or summarize them into a single note.
 
-### The Problem
+### Two Kinds of Memory
 
-```
-[User]  → What's the weather in Tokyo?
-[Agent] → Let me check... It's 22°C and sunny.
-[User]  → What about Osaka?
-[Agent] → (Remembers you asked about Japan) 25°C and rainy.
-[User]  → Book a hotel in Tokyo for next week.
-[Agent] → (Still remembers you were asking about Japan weather) → OK!
-... 50 more messages ...
-[User]  → What was the first thing I asked?
-[Agent] → 😅 I... I don't remember
-```
+| Type | What It Does | In claude-code |
+|---|---|---|
+| **Context / Working Memory** | What's in the current conversation | Auto-compaction (compact.ts) |
+| **Long-term Memory** | What survives between conversations | Memdir (memory.tsx) |
 
-Your agent needs to **manage its own memory** so it doesn't forget important things.
+The first is automatic — the agent compresses old messages when the conversation gets long. The second is intentional — the agent writes notes to files and reads them back later.
 
 ---
 
-## 🔧 Hands-On: Building a Context Manager
+## 🔧 Hands-On: Build Context Management
 
-### Step 1: The Messages Structure
+### Step 1: Getting Ready
 
-LLM APIs use a list of messages:
+We'll build on the `tool_system.py` module from previous chapters. Make sure it's in your project directory.
 
-```python
-messages = [
-    {"role": "system", "content": "You are a helpful assistant."},
-    {"role": "user", "content": "What's the weather in Tokyo?"},
-    {"role": "assistant", "content": "It's 22°C and sunny."},
-]
+We'll use `tiktoken` to count tokens:
+
+```bash
+pip install tiktoken
 ```
 
-Each message has a **role** (system, user, assistant) and **content**.
+### Step 2: The ContextManager with Auto-Compaction
 
-### Step 2: Token Counting
+In claude-code, context compaction is automatic — when the token count hits ~75% of the limit, old messages are compressed into a summary. This preserves key decisions and results while dropping verbatim tool outputs.
 
-Different models have different context limits:
-
-| Model | Max Context | Suggested Max Output |
-|---|---|---|
-| GPT-4o-mini | 128,000 tokens | 16,384 tokens |
-| GPT-4o | 128,000 tokens | 16,384 tokens |
-| Claude 3.5 Sonnet | 200,000 tokens | 8,192 tokens |
-| Claude 4 Sonnet | 200,000 tokens | 8,192 tokens |
-
-A rough rule: **1 token ≈ 0.75 words** in English.
-
-Let's count tokens without needing a full tokenizer:
+Let's build our version, mirroring the logic from `restored-src/src/services/compact/compact.ts`:
 
 ```python
-import tiktoken  # OpenAI's tokenizer
+# context_manager.py
 
-def count_tokens(text: str, model: str = "gpt-4o-mini") -> int:
-    """Count the number of tokens in a text string."""
-    try:
-        encoder = tiktoken.encoding_for_model(model)
-    except KeyError:
-        encoder = tiktoken.get_encoding("cl100k_base")
-    return len(encoder.encode(text))
+from typing import List, Optional, Dict, Any
 
-def count_messages_tokens(messages: list, model: str = "gpt-4o-mini") -> int:
-    """Count total tokens in a message list."""
-    total = 0
-    for msg in messages:
-        total += count_tokens(msg["content"], model)
-        total += 4  # overhead per message
-    total += 2  # overhead for the whole request
-    return total
-```
+try:
+    import tiktoken
+    HAS_TIKTOKEN = True
+except ImportError:
+    HAS_TIKTOKEN = False
+    print("⚠️ tiktoken not installed. Run: pip install tiktoken")
 
-> **Install tiktoken**: `pip install tiktoken`
 
-### Step 3: Sliding Window Context Manager
-
-The simplest strategy: keep the **system prompt** + the **last N messages**.
-
-```python
-class SlidingWindowContext:
-    """Keep only the most recent messages within token budget."""
-
-    def __init__(self, system_prompt: str, max_tokens: int = 8000, model: str = "gpt-4o-mini"):
-        self.system_prompt = {"role": "system", "content": system_prompt}
-        self.messages = []
+class ContextManager:
+    """
+    Tracks token usage and compacts context when nearing the limit.
+    
+    Like claude-code's auto-compaction (source:
+    restored-src/src/services/compact/compact.ts).
+    Compaction is triggered at ~75% capacity.
+    """
+    def __init__(self, max_tokens: int = 128000, model: str = "gpt-4o-mini"):
         self.max_tokens = max_tokens
         self.model = model
+        self.compaction_threshold = int(max_tokens * 0.75)
+        self.total_tokens_used = 0
 
-    def add_message(self, role: str, content: str):
-        """Add a message and trim if needed."""
-        self.messages.append({"role": role, "content": content})
-        self._trim()
+    def count_tokens(self, text: str) -> int:
+        """Count tokens in a text string."""
+        if HAS_TIKTOKEN:
+            try:
+                encoder = tiktoken.encoding_for_model(self.model)
+            except KeyError:
+                encoder = tiktoken.get_encoding("cl100k_base")
+            return len(encoder.encode(text))
+        # Fallback: rough estimate (1 token ≈ 0.75 words)
+        return int(len(text.split()) / 0.75)
 
-    def _trim(self):
-        """Remove oldest messages until within budget."""
-        while True:
-            all_msgs = [self.system_prompt] + self.messages
-            total = count_messages_tokens(all_msgs, self.model)
-            if total <= self.max_tokens or len(self.messages) <= 1:
-                break
-            # Remove the oldest user+assistant pair
-            self.messages.pop(0)  # Remove oldest message
-            # If it was a user message, also remove the corresponding assistant response
-            if self.messages and self.messages[0]["role"] == "assistant":
-                self.messages.pop(0)
+    def count_messages_tokens(self, messages: list) -> int:
+        """Count total tokens in a message list."""
+        total = 0
+        for msg in messages:
+            total += self.count_tokens(str(msg.get("content", "")))
+            total += 4  # overhead per message
+        total += 2  # overhead for the request
+        return total
 
-    def get_messages(self) -> list:
-        """Get the full message list for API call."""
-        return [self.system_prompt] + self.messages
+    def check_budget(self, messages: list) -> Dict[str, Any]:
+        """
+        Check token budget and return status.
+        
+        Returns:
+            {"ok": True, "usage": ...} — within budget
+            {"ok": False, "action": "compact", ...} — should compact
+        """
+        current = self.count_messages_tokens(messages)
+        usage_percent = round(current / self.max_tokens * 100, 1)
 
-    def get_stats(self) -> dict:
-        """Show memory usage statistics."""
-        all_msgs = [self.system_prompt] + self.messages
+        if current > self.compaction_threshold:
+            return {
+                "ok": False,
+                "action": "compact",
+                "current": current,
+                "max": self.max_tokens,
+                "usage_percent": usage_percent,
+                "message": f"Context at {usage_percent}% ({current}/{self.max_tokens}). "
+                           f"Compacting..."
+            }
         return {
-            "total_messages": len(all_msgs),
-            "total_tokens": count_messages_tokens(all_msgs, self.model),
-            "max_tokens": self.max_tokens,
-            "usage_percent": round(
-                count_messages_tokens(all_msgs, self.model) / self.max_tokens * 100, 1
-            ),
+            "ok": True,
+            "current": current,
+            "max": self.max_tokens,
+            "usage_percent": usage_percent,
+            "remaining": self.max_tokens - current,
         }
+
+    def compact(self, messages: list) -> list:
+        """
+        Compact messages by keeping system prompt + recent exchanges verbatim
+        and summarizing the middle.
+        
+        Key behaviors from claude-code (compact.ts):
+        - Keeps system prompt intact
+        - Preserves the most recent user/tool exchanges verbatim
+        - Summarizes older exchanges into a concise note
+        - Retains all tool call structure (names, arguments)
+        """
+        if len(messages) <= 4:
+            return messages  # Too short to compact
+
+        system_msgs = [m for m in messages if m["role"] == "system"]
+
+        # Keep last 4 messages (2 user-assistant turns) verbatim
+        recent = messages[-4:]
+        old = messages[len(system_msgs):-4]
+
+        if not old:
+            return messages
+
+        # Build a summary of old messages
+        old_count = len(old)
+        old_roles = [m["role"] for m in old]
+        has_tools = any(r == "tool" or r == "assistant" for r in old_roles)
+
+        summary_parts = []
+        if has_tools:
+            summary_parts.append("Previous steps included tool calls and their results.")
+        summary_parts.append(f"{old_count} older messages have been compacted.")
+
+        summary = " | ".join(summary_parts)
+
+        # Reconstruct: system + summary + recent
+        compacted = list(system_msgs)
+        compacted.append({
+            "role": "system",
+            "content": f"[Context compacted: {summary}]"
+        })
+        compacted.extend(recent)
+
+        return compacted
+
+    def update_tracking(self, response) -> None:
+        """Update token tracking from an API response."""
+        if hasattr(response, 'usage') and response.usage:
+            self.total_tokens_used += response.usage.total_tokens
 ```
 
-### Step 4: Using It With Your Agent
+### Step 3: Using ContextManager in the Agent Loop
+
+Now let's use the `ContextManager` in our agent loop from Chapter 03:
 
 ```python
-import openai
+from tool_system import Schema, Tool, ToolDef, build_tool, ToolRegistry
+from context_manager import ContextManager
+from openai import OpenAI
+import json
+import os
+import math
 
-def agent_with_memory(user_input: str, context: SlidingWindowContext) -> str:
-    """An agent that remembers the conversation."""
-    # Add user message
-    context.add_message("user", user_input)
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-    # Get messages within budget
-    messages = context.get_messages()
+# ─── Define tools ────────────────────────────────────
 
-    # Call the LLM
-    response = openai.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=messages,
-    )
+# ... (same tools from Chapter 03: calculator, searcher, clock)
 
-    reply = response.choices[0].message.content
-    context.add_message("assistant", reply)
-    return reply
-
-# Let's try it!
-context = SlidingWindowContext(
-    system_prompt="You are a helpful agent. Be concise.",
-    max_tokens=4000,
+calc_schema = Schema(
+    properties={"expression": {"type": "string", "description": "Math expression"}},
+    required=["expression"],
 )
+def calc_impl(expression: str) -> str:
+    allowed = {"sqrt": math.sqrt, "pi": math.pi, "abs": abs}
+    return str(eval(expression, {"__builtins__": {}}, allowed))
 
-print(agent_with_memory("Hi! My name is Alice.", context))
-print(context.get_stats())
+calculator = build_tool(ToolDef(
+    name="calculate", description="Do math",
+    input_schema=calc_schema, call=calc_impl, is_concurrency_safe=True,
+))
 
-print(agent_with_memory("What's my name?", context))
-# Should remember: Alice!
+# Register etc.
+registry = ToolRegistry()
+registry.register(calculator)
+# ... register more tools
 
-print(agent_with_memory("Tell me a joke.", context))
-print(context.get_stats())
-```
+# ─── Agent with auto-compaction ──────────────────────
 
-### Step 5: Summary-Based Compression
+ctx = ContextManager(max_tokens=4000)  # Small limit for testing
 
-When the conversation gets long, instead of just dropping old messages, we can **summarize** them:
+def run_agent(user_input: str, max_steps: int = 10) -> str:
+    messages = [
+        {"role": "system", "content": "You are a helpful agent."},
+        {"role": "user", "content": user_input},
+    ]
 
-```python
-class SummaryCompressionContext:
-    """Summarize old messages instead of discarding them."""
+    step = 0
+    while step < max_steps:
+        step += 1
 
-    def __init__(self, system_prompt: str, llm_func, max_tokens: int = 8000,
-                 summarize_threshold: float = 0.7, model: str = "gpt-4o-mini"):
-        self.system_prompt = {"role": "system", "content": system_prompt}
-        self.recent_messages = []
-        self.summary = "No previous conversation."
-        self.max_tokens = max_tokens
-        self.summarize_threshold = summarize_threshold
-        self.model = model
-        self.llm_func = llm_func  # A function that calls the LLM
-        self.conversation_turns = 0
+        # Check budget BEFORE the API call
+        budget = ctx.check_budget(messages)
+        print(f"📊 Budget: {budget['usage_percent']}% used")
 
-    def add_message(self, role: str, content: str):
-        self.recent_messages.append({"role": role, "content": content})
-        self.conversation_turns += 1
-        self._maybe_summarize()
+        if not budget["ok"]:
+            print(f"⚠️ {budget['message']}")
+            messages = ctx.compact(messages)
+            print(f"📦 After compaction: {ctx.count_messages_tokens(messages)} tokens")
 
-    def _maybe_summarize(self):
-        """If we're over budget, summarize everything except the last 2 turns."""
-        all_msgs = [self.system_prompt]
-        if self.summary:
-            all_msgs.append({"role": "system", "content": f"Previous summary: {self.summary}"})
-        all_msgs += self.recent_messages
-
-        total = count_messages_tokens(all_msgs, self.model)
-        # Keep last 4 messages (2 turns) safe
-        keep_count = 4
-        while total > self.max_tokens * self.summarize_threshold and len(self.recent_messages) > keep_count:
-            # Take the oldest messages to summarize
-            old_msgs = self.recent_messages[:-keep_count]
-            self.recent_messages = self.recent_messages[-keep_count:]
-
-            # Summarize them
-            text_to_summarize = "\n".join(
-                f"{m['role']}: {m['content']}" for m in old_msgs
-            )
-            summary_prompt = (
-                f"Summarize this conversation concisely, keeping key facts, names, "
-                f"preferences, and task states:\n\n{text_to_summarize}"
-            )
-            self.summary = self.llm_func(summary_prompt)
-
-            # Recalculate
-            all_msgs = [self.system_prompt]
-            if self.summary:
-                all_msgs.append({"role": "system", "content": f"Previous summary: {self.summary}"})
-            all_msgs += self.recent_messages
-            total = count_messages_tokens(all_msgs, self.model)
-
-    def get_messages(self) -> list:
-        msgs = [self.system_prompt]
-        if self.summary and self.summary != "No previous conversation.":
-            msgs.append({"role": "system", "content": f"Conversation summary so far: {self.summary}"})
-        msgs += self.recent_messages
-        return msgs
-```
-
-### Step 6: Putting It All Together
-
-```python
-# A complete working agent with context management
-import openai
-
-class SmartAgent:
-    def __init__(self, system_prompt: str = "You are a helpful agent.", max_tokens: int = 8000):
-        self.context = SlidingWindowContext(system_prompt, max_tokens)
-
-    def run(self, user_input: str) -> str:
-        self.context.add_message("user", user_input)
-        messages = self.context.get_messages()
-
-        response = openai.chat.completions.create(
+        # THINK
+        response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=messages,
+            tools=registry.get_openai_schemas(),
         )
+        ctx.update_tracking(response)
 
-        reply = response.choices[0].message.content
-        self.context.add_message("assistant", reply)
-        return reply
+        msg = response.choices[0].message
 
-    def memory_usage(self):
-        return self.context.get_stats()
+        # DONE?
+        if not msg.tool_calls:
+            return msg.content
 
-# Demo
-agent = SmartAgent(
-    system_prompt="You're a friendly assistant. Remember user preferences.",
-    max_tokens=2000,
+        # ACT + OBSERVE
+        messages.append(msg)
+        for tc in msg.tool_calls:
+            args = json.loads(tc.function.arguments)
+            result = registry.run_tool(tc.function.name, args)
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+
+    return "Max steps reached."
+
+
+# Test with a multi-step task
+if __name__ == "__main__":
+    result = run_agent("Calculate 10 + 20, then multiply by 3, then subtract 5.")
+    print(f"\n📨 Final: {result}")
+    print(f"\n📊 Total tokens used in this session: {ctx.total_tokens_used}")
+```
+
+### Step 4: Persistent Memory with Memdir
+
+Context management handles the current conversation. But what about **remembering things between conversations**? Claude-code uses a **memdir** — a directory of markdown files in `~/.claude/memory/`.
+
+Each file is one "memory note" that the agent can write, read, and search. Let's build our version:
+
+```python
+# memdir.py — File-based persistent memory
+# Like claude-code's memdir (source: restored-src/src/commands/memory/memory.tsx)
+
+from pathlib import Path
+from datetime import datetime
+from typing import List, Optional
+
+
+class Memdir:
+    """
+    File-based persistent memory system.
+    
+    Each memory is a markdown file in a directory.
+    Files persist across sessions and can be independently
+    searched, edited, or deleted.
+    
+    Like claude-code's ~/.claude/memory/ system.
+    """
+    def __init__(self, memdir_path: str = "~/.agent_memory"):
+        self.path = Path(memdir_path).expanduser()
+        self.path.mkdir(parents=True, exist_ok=True)
+
+    def write(self, title: str, content: str) -> str:
+        """
+        Write a memory note.
+        Creates a markdown file with the given title and content.
+        """
+        filename = self._sanitize(title) + ".md"
+        filepath = self.path / filename
+        timestamp = datetime.now().isoformat()
+
+        full_content = (
+            f"# {title}\n\n"
+            f"{content}\n\n"
+            f"---\n"
+            f"*Created: {timestamp}*"
+        )
+        filepath.write_text(full_content)
+        return str(filepath)
+
+    def read(self, title: str) -> Optional[str]:
+        """Read a memory note by title."""
+        filepath = self.path / (self._sanitize(title) + ".md")
+        if filepath.exists():
+            return filepath.read_text()
+        return None
+
+    def list_all(self) -> List[str]:
+        """List all memory note titles."""
+        return sorted([f.stem for f in self.path.glob("*.md")])
+
+    def search(self, query: str) -> List[str]:
+        """Search memory notes by keyword."""
+        results = []
+        for f in self.path.glob("*.md"):
+            if query.lower() in f.read_text().lower():
+                results.append(f.stem)
+        return results
+
+    def delete(self, title: str) -> bool:
+        """Delete a memory note by title."""
+        filepath = self.path / (self._sanitize(title) + ".md")
+        if filepath.exists():
+            filepath.unlink()
+            return True
+        return False
+
+    @staticmethod
+    def _sanitize(name: str) -> str:
+        """Convert a title to a safe filename."""
+        return "".join(c if c.isalnum() or c in " -_" else "_" for c in name).strip()
+```
+
+### Step 5: Using Memdir in Your Agent
+
+Now let's give our agent a **remember** tool and a **recall** tool, so it can use its long-term memory:
+
+```python
+# ─── Memory tools ────────────────────────────────────
+
+memdir = Memdir()
+
+remember_schema = Schema(
+    properties={
+        "title": {"type": "string", "description": "A short title for this memory"},
+        "content": {"type": "string", "description": "What to remember"},
+    },
+    required=["title", "content"],
 )
 
-print("=== Agent with Memory ===")
-print(agent.run("Hi! I'm Bob and I love science fiction books."))
-print(f"Memory: {agent.memory_usage()}")
-print()
-print(agent.run("What genre do I like?"))
-print(f"Memory: {agent.memory_usage()}")
+def remember_impl(title: str, content: str) -> str:
+    """Save a memory note."""
+    path = memdir.write(title, content)
+    return f"✅ Saved memory '{title}'"
+
+remember_tool = build_tool(ToolDef(
+    name="remember",
+    description="Save an important fact to long-term memory. Use for user preferences, key facts, and things to remember later.",
+    input_schema=remember_schema,
+    call=remember_impl,
+    is_concurrency_safe=False,  # Writing to disk: sequential
+    aliases=["save", "memorize"],
+))
+
+recall_schema = Schema(
+    properties={
+        "query": {"type": "string", "description": "What to search for in memory"},
+    },
+    required=["query"],
+)
+
+def recall_impl(query: str) -> str:
+    """Search saved memories."""
+    results = memdir.search(query)
+    if not results:
+        return f"No memories found about '{query}'."
+    
+    output = [f"📖 Found {len(results)} memory(ies):"]
+    for title in results[:5]:  # Limit to top 5
+        content = memdir.read(title)
+        # Extract just the first line of content
+        first_line = content.split('\n')[2] if content else "(empty)"
+        output.append(f"  • {title}: {first_line[:100]}")
+    return "\n".join(output)
+
+recall_tool = build_tool(ToolDef(
+    name="recall",
+    description="Search your long-term memory for saved information.",
+    input_schema=recall_schema,
+    call=recall_impl,
+    is_concurrency_safe=True,
+    aliases=["search_memory", "find_memory"],
+))
+
+# Register memory tools
+registry.register_many([remember_tool, recall_tool])
+```
+
+Now the agent can:
+- `remember(title="Alice's name", content="User's name is Alice")` — save a fact
+- `recall(query="Alice")` — retrieve it later
+
+### Step 6: Full Agent with Both Memory Systems
+
+```python
+# ─── Complete agent with short-term + long-term memory ──
+
+def run_agent_with_memory(user_input: str, max_steps: int = 10) -> str:
+    messages = [
+        {"role": "system", "content": (
+            "You are a helpful agent with two memory systems:\n"
+            "1. Short-term: the conversation context (auto-managed)\n"
+            "2. Long-term: use 'remember' to save important facts "
+            "and 'recall' to retrieve them later.\n\n"
+            "When the user tells you something personal or important, "
+            "use 'remember' to save it."
+        )},
+        {"role": "user", "content": user_input},
+    ]
+
+    step = 0
+    while step < max_steps:
+        step += 1
+
+        # Auto-compaction check
+        budget = ctx.check_budget(messages)
+        if not budget["ok"]:
+            messages = ctx.compact(messages)
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            tools=registry.get_openai_schemas(),
+        )
+        msg = response.choices[0].message
+
+        if not msg.tool_calls:
+            return msg.content
+
+        messages.append(msg)
+        for tc in msg.tool_calls:
+            args = json.loads(tc.function.arguments)
+            result = registry.run_tool(tc.function.name, args)
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+
+    return "Max steps reached."
+
+
+# ─── Try it ──────────────────────────────────────────
+
+if __name__ == "__main__":
+    # First conversation
+    print("=== Session 1 ===")
+    r1 = run_agent_with_memory("Hi! My name is Alice. I love Python programming.")
+    print(f"Agent: {r1}\n")
+
+    r2 = run_agent_with_memory("What do I like?")
+    print(f"Agent: {r2}\n")
+
+    # The memory persists in files — even if we restart!
+    print("\n📂 Saved memories:")
+    for m in memdir.list_all():
+        print(f"  📄 {m}")
+
+    print("\n=== Session 2 (after restart) ===")
+    # The agent starts fresh, but can still recall
+    r3 = run_agent_with_memory("What's my name and what do I like?")
+    print(f"Agent: {r3}")
 ```
 
 ---
 
 ## 🔍 How It Works
 
-### Token Counting
+### Auto-Compaction vs. Sliding Window
 
-Different models use different tokenizers:
-- **OpenAI**: uses `cl100k_base` (GPT-4, GPT-4o) or `r50k_base` (GPT-3)
-- **Anthropic**: Claude uses its own tokenizer
-- **General rule**: English text ≈ 1 token per 0.75 words
-
-The context window includes **both input and output tokens**. If your limit is 8,000 tokens and you send 6,000 tokens of messages, the model can only generate 2,000 tokens of response.
-
-### Sliding Window vs Summary Compression
-
-| Strategy | Pros | Cons |
+| Feature | Sliding Window (naive) | Auto-Compaction (claude-code style) |
 |---|---|---|
-| Sliding Window | Simple, fast, lossless for recent messages | Loses old information completely |
-| Summary Compression | Retains key information from entire conversation | Slower, may lose details, extra LLM cost |
+| What happens | Old messages are dropped | Old messages are summarized |
+| Information loss | Complete loss of old context | Summary preserves key facts |
+| Trigger | At every add | At ~75% of token budget |
+| System prompt | Stays intact | Stays intact |
+| Recent context | Last N messages | Last 2 turns verbatim |
 
-### Pro Tip: Hybrid Approach
+Auto-compaction is smarter because it **preserves information** instead of dropping it. If the user mentioned their name 50 messages ago, a sliding window would have forgotten it. Auto-compaction keeps a summary that includes "User's name is Alice."
 
-Use a **sliding window** for short conversations and **summary compression** for long ones:
+### The 75% Threshold
 
-```python
-class HybridContext:
-    def __init__(self, system_prompt, model="gpt-4o-mini"):
-        self.inner = SlidingWindowContext(system_prompt, max_tokens=16000, model=model)
-        self.inner.max_tokens = 16000  # Use sliding window for most
-        
-    # ... uses sliding window until ~60% full, then switches to compression
+Claude-code triggers compaction at ~75% of the max token limit. Why not 100%?
+
+- API calls need room for the **response** tokens
+- Tool results vary in size
+- A late compaction might fail if the context is already at the limit
+
+The 75% threshold gives safe headroom.
+
+### Memdir: Why Files?
+
+Claude-code uses individual files (not a database) for memory because:
+
+1. **Simple**: Each file is one note. No SQL, no complex queries.
+2. **Searchable**: Standard tools (`grep`, `find`) work on them.
+3. **Editable**: The user can open a memory file and edit it.
+4. **Persistent**: Files survive agent restarts.
+5. **Portable**: Copy the memdir anywhere — all memories come with you.
+
+### Two Memory Layers Working Together
+
+```
+┌─────────────────────────────────────────────────────┐
+│                   Agent Session                     │
+│                                                     │
+│  ┌─────────────────────────────────────────────┐   │
+│  │  Short-Term Memory (ContextManager)          │   │
+│  │  • Current conversation                     │   │
+│  │  • Auto-compacted at 75%                    │   │
+│  │  • Lost when session ends                   │   │
+│  └─────────────────────────────────────────────┘   │
+│                         │                          │
+│                         ▼                          │
+│  ┌─────────────────────────────────────────────┐   │
+│  │  Long-Term Memory (Memdir)                  │   │
+│  │  • Markdown files on disk                   │   │
+│  │  • Written by 'remember' tool               │   │
+│  │  • Read by 'recall' tool                    │   │
+│  │  • Persists across sessions                 │   │
+│  └─────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## 🧪 Exercises
 
-1. **Try different window sizes**: Change `max_tokens` to 500, 2000, 16000. How does the agent's behavior change?
+### Exercise 1: Observe Compaction in Action
 
-2. **Track token usage**: Add logging that prints token count and window size after every message.
+Set a very low `max_tokens` (e.g., 500) and run a multi-step task. Watch the compaction trigger messages:
 
-3. **Build priority memory**: Instead of just keeping recent messages, keep messages where the user said something important (has "remember", "my name is", "I like").
+```python
+ctx = ContextManager(max_tokens=500)
+```
 
-4. **Compare strategies**: Build both context managers, run the same long conversation through both, and see which one retains more useful information.
+Ask a long series of questions and observe when compaction kicks in.
 
-5. **Add a "reminder" feature**: Let the user say "remember this: ..." and keep that fact permanently in the system prompt.
+### Exercise 2: Search Memories
+
+Write a function that searches all memory files for a keyword and returns matching titles plus the matching line:
+
+```python
+def search_memories_detail(query: str) -> List[dict]:
+    """Search memories and return detailed results."""
+    results = []
+    for f in Path("~/.agent_memory").expanduser().glob("*.md"):
+        content = f.read_text()
+        if query.lower() in content.lower():
+            results.append({
+                "title": f.stem,
+                "file": str(f),
+                "size": len(content),
+            })
+    return results
+```
+
+### Exercise 3: Add a "forget" Tool
+
+Create a tool that lets the agent delete memories:
+
+```python
+def forget_impl(title: str) -> str:
+    if memdir.delete(title):
+        return f"✅ Deleted memory '{title}'"
+    return f"❌ No memory found with title '{title}'"
+
+forget_tool = build_tool(ToolDef(
+    name="forget",
+    description="Delete a saved memory by title.",
+    input_schema=Schema(
+        properties={"title": {"type": "string", "description": "Title of memory to delete"}},
+        required=["title"],
+    ),
+    call=forget_impl,
+    is_concurrency_safe=False,
+))
+```
+
+### Exercise 4: Add Memory to the System Prompt
+
+Modify the agent to inject relevant memories into the system prompt at the start:
+
+```python
+def build_prompt_with_memories(user_input: str) -> list:
+    memories = memdir.search(user_input)
+    memory_context = ""
+    if memories:
+        notes = [f"- {t}" for t in memories]
+        memory_context = "Relevant memories:\n" + "\n".join(notes)
+
+    return [
+        {"role": "system", "content": (
+            "You are a helpful agent.\n"
+            + (memory_context + "\n" if memory_context else "")
+        )},
+        {"role": "user", "content": user_input},
+    ]
+```
+
+### Challenge: Automatic Memory Consolidation
+
+Build a system that automatically summarizes key facts from long conversations and saves them to memdir:
+
+```python
+def consolidate_memories(messages: list, llm_func) -> None:
+    """Extract key facts from a conversation and save to memory."""
+    conversation = "\n".join(
+        f"{m['role']}: {m['content']}" 
+        for m in messages if m['role'] in ('user', 'assistant')
+    )
+    prompt = (
+        f"Extract key facts from this conversation (user preferences, "
+        f"important decisions, personal information). "
+        f"Format as bullet points:\n\n{conversation}"
+    )
+    facts = llm_func(prompt)
+    if facts.strip():
+        memdir.write(f"Consolidated {datetime.now().strftime('%Y-%m-%d')}", facts)
+```
 
 ---
 
 ## 📝 Summary
 
-- **Context window** is your agent's desk — it can only fit so much
-- **Tokens** are how LLMs measure text length (~0.75 words per token)
-- **Sliding window** keeps the most recent messages within budget
-- **Summary compression** condenses old messages to save space
-- A good memory system is essential for useful agents
+### Key Concepts
 
-### Behind the Code: How claude-code Manages Context and Memory
+| Concept | What It Means | In claude-code |
+|---|---|---|
+| **Context window** | The LLM's working memory, limited to N tokens | `max_tokens` constant |
+| **Auto-compaction** | Compress old messages at ~75% capacity | `restored-src/src/services/compact/compact.ts` |
+| **Memdir** | File-based memory system with markdown files | `restored-src/src/commands/memory/memory.tsx` |
+| **Short-term memory** | Current conversation (auto-managed) | Context window |
+| **Long-term memory** | Persistent notes (agent-managed) | `~/.claude/memory/` |
 
-The real **claude-code** ([sourcemap](https://github.com/ChinaSiro/claude-code-sourcemap)) handles context management very differently from the educational examples above. Here's what actually happens:
-
-**Source: [`restored-src/src/services/compact/compact.ts`](https://github.com/ChinaSiro/claude-code-sourcemap/blob/main/restored-src/src/services/compact/compact.ts)**
-
-#### Auto-Compaction
-
-Instead of a sliding window, claude-code uses **auto-compaction** — it automatically compresses context when it's about to overflow:
+### The Code You Own
 
 ```python
-# Conceptual model of claude-code's auto-compaction
-# Source: restored-src/src/services/compact/compact.ts
+from context_manager import ContextManager
+from memdir import Memdir
 
-class ContextCompactor:
-    """
-    Automatically compacts context when nearing the token limit.
-    
-    In the real claude-code, this produces a "compact transcript" that
-    replaces old messages with summarized versions, preserving key
-    decisions and results while dropping verbatim tool outputs.
-    """
-    def __init__(self, max_tokens: int = 128000):
-        self.max_tokens = max_tokens
-        self.compaction_threshold = int(max_tokens * 0.75)  # 75% triggers compaction
-        
-    def needs_compaction(self, current_tokens: int) -> bool:
-        """Check if context needs compaction (triggered at ~75% capacity)."""
-        return current_tokens > self.compaction_threshold
-    
-    def compact(self, messages: list) -> list:
-        """
-        Compact the message list by summarizing older exchanges.
-        
-        Key behaviors:
-        - Keeps system prompt intact
-        - Preserves the most recent user-tool interactions verbatim
-        - Summarizes older tool results into concise descriptions
-        - Retains all tool call structure (names, arguments), only compressing outputs
-        """
-        # Keep system prompt + last N exchanges verbatim
-        system_msgs = [m for m in messages if m["role"] == "system"]
-        recent = messages[-6:] if len(messages) > 6 else messages  # Keep last 3 turns
-        old = messages[len(system_msgs):-6] if len(messages) > 6 else []
-        
-        if not old:
-            return messages
-        
-        # Summarize old messages (simplified)
-        summary = f"[Compact: {len(old)} older messages summarized]"
-        compacted = system_msgs + [
-            {"role": "system", "content": f"Previous context: {summary}"}
-        ] + recent
-        
-        return compacted
+# Auto-compaction at 75%
+ctx = ContextManager(max_tokens=128000)
+budget = ctx.check_budget(messages)
+if not budget["ok"]:
+    messages = ctx.compact(messages)
+
+# Persistent memory
+memdir = Memdir("~/.agent_memory")
+memdir.write("user_name", "Alice likes Python")
+print(memdir.search("Python"))  # → ["user_name"]
+memdir.read("user_name")        # → "# user_name\n\nAlice likes Python\n..."
 ```
-
-#### Memdir: File-Based Memory
-
-Claude-code doesn't store memory in the conversation itself — it uses a **memdir** (`~/.claude/memory/`) with individual markdown files:
-
-**Source: [`restored-src/src/commands/memory/memory.tsx`](https://github.com/ChinaSiro/claude-code-sourcemap/blob/main/restored-src/src/commands/memory/memory.tsx)**
-
-```python
-# Conceptual model of claude-code's memory system
-# Source: restored-src/src/memory.ts
-
-import os
-from pathlib import Path
-from datetime import datetime
-
-class Memdir:
-    """
-    File-based memory storage.
-    
-    Claude-code stores each memory as a markdown file in ~/.claude/memory/.
-    Each file is a separate "note" the agent can write and read.
-    """
-    def __init__(self, memdir_path: str = "~/.claude/memory"):
-        self.path = Path(memdir_path).expanduser()
-        self.path.mkdir(parents=True, exist_ok=True)
-    
-    def write(self, title: str, content: str) -> str:
-        """Write a memory file. Source: memory.tsx — writeMemory."""
-        filename = self._sanitize_filename(title) + ".md"
-        filepath = self.path / filename
-        timestamp = datetime.now().isoformat()
-        full_content = f"# {title}\n\n{content}\n\n---\n*Created: {timestamp}*"
-        filepath.write_text(full_content)
-        return str(filepath)
-    
-    def read(self, title: str) -> Optional[str]:
-        """Read a memory file by title. Source: memory.tsx — readMemory."""
-        filepath = self.path / (self._sanitize_filename(title) + ".md")
-        if filepath.exists():
-            return filepath.read_text()
-        return None
-    
-    def list_all(self) -> List[str]:
-        """List all memory files. Source: memory.tsx — listMemories."""
-        return sorted([f.stem for f in self.path.glob("*.md")])
-    
-    def search(self, query: str) -> List[str]:
-        """Search memories by keyword. Source: memory.tsx — searchMemories."""
-        results = []
-        for f in self.path.glob("*.md"):
-            if query.lower() in f.read_text().lower():
-                results.append(f.stem)
-        return results
-    
-    @staticmethod
-    def _sanitize_filename(name: str) -> str:
-        """Convert a title to a safe filename."""
-        return "".join(c if c.isalnum() or c in " -_" else "_" for c in name).strip()
-```
-
-This file-based approach means memories **persist across sessions** and can be independently searched, edited, or deleted. It also means the memory system doesn't consume conversation tokens unless explicitly loaded.
 
 > **Next up: Chapter 07 — Long-Term Memory. We'll teach your agent to remember things across different conversations!**
